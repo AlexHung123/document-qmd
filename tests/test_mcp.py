@@ -181,6 +181,11 @@ class ComposeQueryTests(unittest.TestCase):
         query, mode = compose_query({"query": "hello"})
         self.assertEqual((query, mode), ("hello", "search"))
 
+    def test_plain_query_mode_query_fills_lex_and_vec(self):
+        query, mode = compose_query({"query": "hello", "intent": "Find the note", "mode": "query"})
+        self.assertEqual(mode, "query")
+        self.assertEqual(query, "intent: Find the note\nlex: hello\nvec: hello")
+
 
 class McpConfigTests(unittest.TestCase):
     def test_user_id_required(self):

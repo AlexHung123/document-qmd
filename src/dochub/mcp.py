@@ -11,7 +11,7 @@ from urllib.request import Request, urlopen
 from . import __version__
 from .log import log
 from .paths import PathError, parse_user_id
-from .scope import constrain_to_pin, parse_document_path, parse_folder_scope, resolve_scope
+from .scope import constrain_to_pin, parse_document_path, parse_document_ref, parse_folder_scope, path_under_prefix, resolve_scope
 
 PROTOCOL_VERSIONS = ("2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25")
 DEFAULT_URL = "http://127.0.0.1:8787"
@@ -102,19 +102,60 @@ class DochubClient:
 
     def search(
         self,
-        query: str,
+        query: str | None = None,
         *,
         mode: str = "search",
         limit: int = 10,
         path: str | None = None,
         min_score: float | None = None,
+        searches: list[dict[str, str]] | None = None,
+        intent: str | None = None,
+        rerank: bool | None = None,
+        candidate_limit: int | None = None,
     ) -> dict[str, Any]:
-        body: dict[str, Any] = {"query": query, "mode": mode, "limit": limit}
+        body: dict[str, Any] = {"mode": mode, "limit": limit}
+        if query:
+            body["query"] = query
         if path:
             body["path"] = path
         if min_score is not None:
             body["min_score"] = min_score
+        if searches:
+            body["searches"] = searches
+        if intent:
+            body["intent"] = intent
+        if rerank is not None:
+            body["rerank"] = rerank
+        if candidate_limit is not None:
+            body["candidate_limit"] = candidate_limit
         return self._call("POST", "/v1/search", body)
+
+    def status(self) -> dict[str, Any]:
+        return self._call("GET", "/v1/status")
+
+    def context(self) -> dict[str, Any]:
+        return self._call("GET", "/v1/context")
+
+    def multi_get(
+        self,
+        files,
+        *,
+        from_line: int | None = None,
+        max_lines: int | None = None,
+        max_bytes: int | None = None,
+        line_numbers: bool = True,
+        path: str | None = None,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {"files": files, "line_numbers": line_numbers}
+        if from_line is not None:
+            body["from_line"] = from_line
+        if max_lines is not None:
+            body["max_lines"] = max_lines
+        if max_bytes is not None:
+            body["max_bytes"] = max_bytes
+        if path:
+            body["path"] = path
+        return self._call("POST", "/v1/documents/multi", body)
 
     def get_document(
         self,
@@ -144,60 +185,15 @@ class DochubClient:
 
 def compose_query(args: dict[str, Any]) -> tuple[str, str]:
     """Build a Dochub search query + mode from QMD-style MCP arguments."""
-    query = args.get("query")
-    searches = args.get("searches")
-    intent = args.get("intent")
-    mode = args.get("mode")
-    if query is not None and not isinstance(query, str):
-        raise ValueError("query must be a string")
-    if intent is not None and not isinstance(intent, str):
-        raise ValueError("intent must be a string")
-    if mode is not None and mode not in {"search", "vsearch", "query"}:
-        raise ValueError("mode must be search, vsearch, or query")
-    if searches is not None:
-        if not isinstance(searches, list) or not searches:
-            raise ValueError("searches must be a non-empty array")
-        if query:
-            raise ValueError("query and searches are mutually exclusive")
-        lex: list[str] = []
-        vec: list[str] = []
-        hyde: list[str] = []
-        types: set[str] = set()
-        for item in searches:
-            if not isinstance(item, dict):
-                raise ValueError("each search must be an object")
-            kind = item.get("type")
-            text = item.get("query")
-            if kind not in {"lex", "vec", "hyde"}:
-                raise ValueError("search type must be lex, vec, or hyde")
-            if not isinstance(text, str) or not text.strip():
-                raise ValueError("search query is required")
-            types.add(kind)
-            if kind == "lex":
-                lex.append(text.strip())
-            elif kind == "vec":
-                vec.append(text.strip())
-            else:
-                hyde.append(text.strip())
-        if mode is None and types <= {"lex"} and not (intent and intent.strip()):
-            return " ".join(lex), "search"
-        lines: list[str] = []
-        if intent and intent.strip():
-            lines.append(f"intent: {intent.strip()}")
-        if lex:
-            lines.append("lex: " + " ".join(lex))
-        if vec:
-            lines.append("vec: " + " ".join(vec))
-        if hyde:
-            lines.append("hyde: " + " ".join(hyde))
-        return "\n".join(lines), mode or "query"
-    if not query or not query.strip():
-        raise ValueError("provide query or searches")
-    if mode is None:
-        mode = "search"
-    if intent and intent.strip() and mode == "query":
-        return f"intent: {intent.strip()}\nlex: {query.strip()}", mode
-    return query.strip(), mode
+    from .searchreq import compose_qmd_query, parse_typed_searches
+
+    searches = parse_typed_searches(args.get("searches")) if args.get("searches") is not None else []
+    return compose_qmd_query(
+        query=args.get("query"),
+        intent=args.get("intent"),
+        searches=searches,
+        mode=args.get("mode"),
+    )
 
 
 def _glob_match(path: str, pattern: str) -> bool:
@@ -252,7 +248,7 @@ def tool_definitions(folder: str | None) -> list[dict[str, Any]]:
                     "mode": {
                         "type": "string",
                         "enum": ["search", "vsearch", "query"],
-                        "description": "Override retrieval mode. search=BM25, vsearch=semantic, query=hybrid+rerank.",
+                        "description": "Override retrieval mode. search=BM25, vsearch=semantic, query=hybrid RRF (rerank off unless rerank=true).",
                     },
                     "path": {
                         "type": "string",
@@ -260,6 +256,11 @@ def tool_definitions(folder: str | None) -> list[dict[str, Any]]:
                     },
                     "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 10},
                     "minScore": {"type": "number", "minimum": 0, "maximum": 1},
+                    "rerank": {
+                        "type": "boolean",
+                        "description": "Cross-encoder rerank for query mode. Default false; set true to enable.",
+                    },
+                    "candidateLimit": {"type": "integer", "minimum": 1, "maximum": 200},
                 },
             },
             "annotations": {"readOnlyHint": True, "openWorldHint": False},
@@ -332,9 +333,13 @@ def format_search_summary(payload: dict[str, Any]) -> str:
     query = payload.get("query") or ""
     path = payload.get("path")
     scope = f" in {path}" if path else ""
+    fallback = payload.get("fallback") if isinstance(payload.get("fallback"), dict) else None
+    fallback_note = ""
+    if fallback and fallback.get("reason"):
+        fallback_note = f" (fell back to keyword search: {fallback.get('reason')})"
     if not results:
-        return f"No results found for {query!r}{scope}"
-    lines = [f"Found {len(results)} result{'s' if len(results) != 1 else ''} for {query!r}{scope}:", ""]
+        return f"No results found for {query!r}{scope}{fallback_note}"
+    lines = [f"Found {len(results)} result{'s' if len(results) != 1 else ''} for {query!r}{scope}{fallback_note}:", ""]
     for item in results:
         if not isinstance(item, dict):
             continue
@@ -474,20 +479,33 @@ class McpSession:
         return _text_result(f"unknown tool: {name}", is_error=True)
 
     def _tool_query(self, args: dict[str, Any]) -> dict[str, Any]:
-        query, mode = compose_query(args)
+        _composed, mode = compose_query(args)
         limit = args.get("limit", 10)
         if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1 or limit > 50:
             raise ValueError("limit must be an integer 1..50")
         min_score = args.get("minScore", args.get("min_score"))
         if min_score is not None and not isinstance(min_score, (int, float)):
             raise ValueError("minScore must be a number")
+        candidate_limit = args.get("candidateLimit", args.get("candidate_limit"))
+        if candidate_limit is not None and (not isinstance(candidate_limit, int) or isinstance(candidate_limit, bool) or candidate_limit < 1):
+            raise ValueError("candidateLimit must be an integer >= 1")
+        rerank = args.get("rerank")
+        if rerank is not None and not isinstance(rerank, bool):
+            raise ValueError("rerank must be a boolean")
         path = resolve_scope(self.folder, args.get("path"))
+        searches = args.get("searches") if isinstance(args.get("searches"), list) else None
+        intent = args.get("intent") if isinstance(args.get("intent"), str) else None
+        raw_query = args.get("query") if isinstance(args.get("query"), str) else None
         payload = self.client.search(
-            query,
+            None if searches else raw_query,
             mode=mode,
             limit=limit,
             path=path,
             min_score=float(min_score) if min_score is not None else None,
+            searches=searches,
+            intent=intent.strip() if intent and intent.strip() else None,
+            rerank=rerank,
+            candidate_limit=candidate_limit,
         )
         return _text_result(format_search_summary(payload), structured=payload)
 
@@ -500,10 +518,10 @@ class McpSession:
         line_numbers = args.get("lineNumbers", args.get("line_numbers", True))
         if not isinstance(line_numbers, bool):
             raise ValueError("lineNumbers must be a boolean")
-        rel, suf_from, suf_count = parse_document_path(file.strip())
-        rel = constrain_to_pin(rel, self.folder)
+        rel, docid, suf_from, suf_count = parse_document_ref(file.strip())
+        locator = docid or constrain_to_pin(rel, self.folder)
         payload = self.client.get_document(
-            rel,
+            locator,
             from_line=from_line if from_line is not None else suf_from,
             max_lines=max_lines if max_lines is not None else suf_count,
             line_numbers=line_numbers,
@@ -511,8 +529,10 @@ class McpSession:
         doc = payload.get("document") if isinstance(payload, dict) else None
         if not isinstance(doc, dict):
             return _text_result("document not found", is_error=True)
+        if self.folder and isinstance(doc.get("path"), str) and not path_under_prefix(doc["path"], self.folder):
+            return _text_result("path is outside the pinned folder", is_error=True)
         text = doc.get("text") or ""
-        path = doc.get("path") or rel
+        path = doc.get("path") or rel or docid
         header = f"{path}"
         if doc.get("from_line"):
             header += f" (from line {doc['from_line']})"
@@ -520,72 +540,58 @@ class McpSession:
         return _text_result(body, structured=payload)
 
     def _tool_multi_get(self, args: dict[str, Any]) -> dict[str, Any]:
-        pattern = args.get("pattern")
-        if not isinstance(pattern, str) or not pattern.strip():
+        pattern = args.get("pattern", args.get("files"))
+        if isinstance(pattern, list):
+            tokens = [part.strip() for part in pattern if isinstance(part, str) and part.strip()]
+        elif isinstance(pattern, str) and pattern.strip():
+            tokens = [part.strip() for part in pattern.split(",") if part.strip()]
+        else:
+            raise ValueError("pattern is required")
+        if not tokens:
             raise ValueError("pattern is required")
         max_lines = _opt_positive(args.get("maxLines", args.get("max_lines")), "maxLines")
+        max_bytes = args.get("maxBytes", args.get("max_bytes"))
+        if max_bytes is not None and (not isinstance(max_bytes, int) or isinstance(max_bytes, bool) or max_bytes < 1):
+            raise ValueError("maxBytes must be an integer >= 1")
         line_numbers = args.get("lineNumbers", args.get("line_numbers", True))
         if not isinstance(line_numbers, bool):
             raise ValueError("lineNumbers must be a boolean")
-        tokens = [part.strip() for part in pattern.split(",") if part.strip()]
-        if not tokens:
-            raise ValueError("pattern is required")
-        listed = None
-        chunks: list[str] = []
-        errors: list[str] = []
-        documents: list[Any] = []
-        for token in tokens:
-            if any(ch in token for ch in "*?["):
-                if listed is None:
-                    listed = self.client.list_files().get("files") or []
-                matches = []
-                for row in listed:
-                    if not isinstance(row, dict):
-                        continue
-                    rel = row.get("markdown_relpath")
-                    if not isinstance(rel, str) or not rel:
-                        continue
-                    if self.folder and not (
-                        rel == self.folder or rel.startswith(self.folder + "/")
-                    ):
-                        continue
-                    if _glob_match(rel, token):
-                        matches.append((rel, None, None))
-                if not matches:
-                    errors.append(f"no files matched {token}")
-                    continue
-                paths = matches
-            else:
-                try:
-                    rel, suf_from, suf_count = parse_document_path(token)
-                    paths = [(constrain_to_pin(rel, self.folder), suf_from, suf_count)]
-                except PathError as exc:
-                    errors.append(f"{token}: {exc}")
-                    continue
-            for item in paths:
-                if isinstance(item, tuple):
-                    rel, suf_from, suf_count = item
+        payload = self.client.multi_get(
+            tokens,
+            max_lines=max_lines,
+            max_bytes=max_bytes,
+            line_numbers=line_numbers,
+            path=self.folder,
+        )
+        documents = payload.get("documents") if isinstance(payload, dict) else None
+        errors = payload.get("errors") if isinstance(payload, dict) else None
+        if not isinstance(documents, list):
+            documents = []
+        if not isinstance(errors, list):
+            errors = []
+        if self.folder:
+            kept = []
+            for doc in documents:
+                rel = doc.get("path") if isinstance(doc, dict) else None
+                if isinstance(rel, str) and path_under_prefix(rel, self.folder):
+                    kept.append(doc)
                 else:
-                    rel, suf_from, suf_count = item, None, None
-                try:
-                    payload = self.client.get_document(
-                        rel,
-                        from_line=suf_from,
-                        max_lines=max_lines if max_lines is not None else suf_count,
-                        line_numbers=line_numbers,
-                    )
-                except DochubApiError as exc:
-                    errors.append(f"{rel}: {exc}")
-                    continue
-                doc = payload.get("document") if isinstance(payload, dict) else None
-                if not isinstance(doc, dict):
-                    errors.append(f"{rel}: not found")
-                    continue
-                documents.append(doc)
-                chunks.append(f"{doc.get('path')}\n---\n{doc.get('text') or ''}")
+                    errors.append({"file": rel or "?", "error": "outside_pin", "message": "path is outside the pinned folder"})
+            documents = kept
+        chunks = [f"{doc.get('path')}\n---\n{doc.get('text') or ''}" for doc in documents if isinstance(doc, dict)]
+        err_lines = []
+        for item in errors:
+            if isinstance(item, dict):
+                hint = item.get("similar")
+                msg = f"{item.get('file')}: {item.get('message') or item.get('error')}"
+                if hint:
+                    msg += f" (similar: {', '.join(map(str, hint))})"
+                err_lines.append(msg)
+            else:
+                err_lines.append(str(item))
         text = "\n\n".join(chunks) if chunks else "No documents retrieved"
-        if errors:
-            text = "Errors:\n" + "\n".join(errors) + ("\n\n" + text if chunks else "")
+        if err_lines:
+            text = "Errors:\n" + "\n".join(err_lines) + (("\n\n" + text) if chunks else "")
         return _text_result(text, is_error=not chunks, structured={"documents": documents, "errors": errors})
 
     def _tool_tree(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -594,24 +600,34 @@ class McpSession:
         return _text_result(json.dumps(payload, ensure_ascii=False, indent=2), structured=payload)
 
     def _tool_status(self) -> dict[str, Any]:
-        health = self.client.health()
+        try:
+            status = self.client.status()
+        except DochubApiError:
+            status = self.client.health()
         body = {
             "user_id": self.client.user_id,
             "folder": self.folder,
             "url": self.client.base,
-            "health": health,
+            "health": status,
         }
         lines = [
             "Dochub status:",
             f"  user: {self.client.user_id}",
             f"  folder pin: {self.folder or '(entire markdown tree)'}",
             f"  url: {self.client.base}",
-            f"  qmd: {health.get('qmd')}",
+            f"  qmd: {status.get('qmd')}",
         ]
-        queue = health.get("queue")
+        if status.get("keyword_search_ready") is not None:
+            lines.append(f"  keyword_search_ready: {status.get('keyword_search_ready')}")
+        if status.get("semantic_search_ready") is not None:
+            lines.append(f"  semantic_search_ready: {status.get('semantic_search_ready')}")
+        if status.get("hint"):
+            lines.append(f"  hint: {status.get('hint')}")
+        queue = status.get("queue") or (status.get("index") or {}).get("queue")
         if isinstance(queue, dict):
             lines.append(f"  queue: {queue}")
         return _text_result("\n".join(lines), structured=body)
+
 
 
 class MethodNotFound(Exception):

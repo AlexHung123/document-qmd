@@ -67,13 +67,37 @@ def parse_folder_scope(raw: str | None) -> str | None:
     return parse_markdown_relpath(text)
 
 
-def parse_document_path(raw: str) -> tuple[str, int | None, int | None]:
+def parse_docid(raw: str) -> str | None:
+    """Return a normalized `#docid` if `raw` is an index docid, else None."""
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    text, _, _ = split_line_range(raw.strip())
+    if not text.startswith("#"):
+        return None
+    token = text[1:].strip()
+    if not re.fullmatch(r"[0-9A-Za-z]{4,64}", token):
+        raise PathError("invalid docid")
+    return f"#{token}"
+
+
+def parse_document_ref(raw: str) -> tuple[str | None, str | None, int | None, int | None]:
+    """Parse a document locator into (relpath, docid, from_line, max_lines)."""
     if not isinstance(raw, str) or not raw.strip():
         raise PathError("document path is required")
     text, from_line, max_lines = split_line_range(raw.strip())
-    if text.startswith("#"):
-        raise PathError("docid is not supported; use dochub_path from search results")
+    docid = parse_docid(text)
+    if docid:
+        return None, docid, from_line, max_lines
     rel = parse_markdown_relpath(text)
+    if not rel:
+        raise PathError("document path is required")
+    return rel, None, from_line, max_lines
+
+
+def parse_document_path(raw: str) -> tuple[str, int | None, int | None]:
+    rel, docid, from_line, max_lines = parse_document_ref(raw)
+    if docid:
+        raise PathError("docid requires parse_document_ref")
     if not rel:
         raise PathError("document path is required")
     return rel, from_line, max_lines

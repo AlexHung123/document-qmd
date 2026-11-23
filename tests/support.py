@@ -46,7 +46,27 @@ class FakeQmd:
 
     def search(self, user_root: Path, query: str, **kwargs):
         self.calls.append(("search", str(user_root), query, kwargs))
-        return [{**item, "cwd": user_root.name, "query": query} for item in self.search_results]
+        mode = kwargs.get("mode", "search")
+        errors = getattr(self, "search_errors", None) or {}
+        if mode in errors:
+            err = errors[mode]
+            raise err() if callable(err) else err
+        results = (getattr(self, "search_results_by_mode", None) or {}).get(mode, self.search_results)
+        return [{**item, "cwd": user_root.name, "query": query, "mode": mode} for item in results]
+
+    def status(self, user_root: Path):
+        self.calls.append(("status", str(user_root)))
+        return getattr(self, "status_payload", {"available": True, "collections": [{"name": "markdown"}]})
+
+    def context_list(self, user_root: Path):
+        self.calls.append(("context_list", str(user_root)))
+        return getattr(self, "contexts", None)
+
+    def resolve_docid(self, user_root: Path, docid: str):
+        self.calls.append(("resolve_docid", str(user_root), docid))
+        mapping = getattr(self, "docids", {}) or {}
+        key = docid if docid.startswith("#") else f"#{docid}"
+        return mapping.get(key) or mapping.get(docid)
 
     def available(self) -> bool:
         return True

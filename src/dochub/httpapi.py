@@ -23,10 +23,27 @@ from .paths import (
     safe_join,
     unique_relpath,
 )
-from .documents import read_markdown
+from .documents import (
+    DEFAULT_MAX_BYTES,
+    MAX_MULTI_FILES,
+    DocumentNotFound,
+    expand_glob,
+    read_markdown,
+    similar_paths,
+)
+from .indexstatus import build_index_status
 from .qmd import QmdError, QmdRunner
 from .queue import ControlStore, FileRow, TaskRow
-from .scope import filter_results, normalize_search_payload, overfetch_limit, parse_folder_scope
+from .scope import (
+    filter_results,
+    normalize_search_payload,
+    overfetch_limit,
+    parse_document_ref,
+    parse_folder_scope,
+    path_under_prefix,
+)
+from .searchreq import parse_search_body
+from .searchrun import HybridLimiter, search_with_fallback
 from .tree import build_inbox_tree, create_folder
 from .util import atomic_write_bytes, atomic_write_text, new_id, sha256_bytes, utcnow_iso
 
@@ -68,6 +85,7 @@ class App:
         self.settings = settings
         self.store = store
         self.qmd = qmd
+        self.hybrid_limiter = HybridLimiter()
 
     def handle(self, method: str, path: str, headers: dict[str, str], body: bytes) -> Response:
         parsed = urlparse(path)
@@ -81,6 +99,10 @@ class App:
             user_id = user_id_from_headers(headers)
             if method == "GET" and route == "/v1/me":
                 return Response.json(200, {"user_id": user_id})
+            if method == "GET" and route == "/v1/status":
+                return self._status(user_id)
+            if method == "GET" and route == "/v1/context":
+                return self._context(user_id)
             if method == "POST" and route == "/v1/files":
                 return self._upload(user_id, headers, body)
             if method == "POST" and route == "/v1/folders":
@@ -95,6 +117,8 @@ class App:
                 return self._search(user_id, body)
             if method == "GET" and route == "/v1/documents":
                 return self._get_document(user_id, query)
+            if method == "POST" and route == "/v1/documents/multi":
+                return self._multi_get(user_id, body)
             if method == "GET" and route == "/v1/tasks":
                 return self._list_tasks(user_id, query)
             if method == "GET" and route.startswith("/v1/tasks/"):
@@ -119,7 +143,35 @@ class App:
             user_id = parse_user_id(raw.strip())
             body["user_id"] = user_id
             body["queue"] = self.store.counts(user_id)
+            try:
+                body["index"] = self._index_status(user_id)
+            except Exception as exc:
+                log("index status failed", error=str(exc), user_id=user_id)
         return Response.json(200, body)
+
+    def _index_status(self, user_id: str) -> dict[str, Any]:
+        root = ensure_user_tree(self.settings.data_root, user_id, self.qmd)
+        return build_index_status(self.store, user_id, root, self.qmd)
+
+    def _status(self, user_id: str) -> Response:
+        index = self._index_status(user_id)
+        body = {
+            "ok": True,
+            "service": "dochub",
+            "user_id": user_id,
+            "qmd": self.qmd.available(),
+            "index": index,
+            "keyword_search_ready": index.get("keyword_search_ready"),
+            "semantic_search_ready": index.get("semantic_search_ready"),
+            "hint": index.get("hint"),
+            "queue": index.get("queue"),
+            "contexts": index.get("contexts") or [],
+        }
+        return Response.json(200, body)
+
+    def _context(self, user_id: str) -> Response:
+        index = self._index_status(user_id)
+        return Response.json(200, {"user_id": user_id, "contexts": index.get("contexts") or []})
 
     def _upload(self, user_id: str, headers: dict[str, str], body: bytes) -> Response:
         content_type = headers.get("Content-Type") or headers.get("content-type") or ""
@@ -317,44 +369,48 @@ class App:
             raise ValueError("invalid JSON body") from exc
         if not isinstance(obj, dict):
             raise ValueError("JSON body must be an object")
-        query = obj.get("query")
-        if not isinstance(query, str) or not query.strip():
-            raise ValueError("query is required")
-        mode = obj.get("mode") or "search"
-        if mode not in {"search", "vsearch", "query"}:
-            raise ValueError("mode must be search, vsearch, or query")
-        limit = obj.get("limit", 10)
-        if not isinstance(limit, int) or limit < 1 or limit > 50:
-            raise ValueError("limit must be an integer 1..50")
-        min_score = obj.get("min_score")
-        if min_score is not None and not isinstance(min_score, (int, float)):
-            raise ValueError("min_score must be a number")
-        full = bool(obj.get("full", False))
-        path_raw = obj.get("path")
-        if path_raw is not None and not isinstance(path_raw, str):
-            raise ValueError("path must be a string")
-        prefix = parse_folder_scope(path_raw)
+        req = parse_search_body(obj)
+        prefix = parse_folder_scope(req.path)
         root = ensure_user_tree(self.settings.data_root, user_id, self.qmd)
-        fetch_limit = overfetch_limit(limit, scoped=prefix is not None)
-        raw = self.qmd.search(
+        index = None
+        try:
+            index = build_index_status(self.store, user_id, root, self.qmd)
+        except Exception as exc:
+            log("index status failed", error=str(exc), user_id=user_id)
+        fetch_limit = overfetch_limit(req.limit, scoped=prefix is not None)
+        semantic_ready = None if index is None else bool(index.get("semantic_search_ready"))
+        raw, fallback = search_with_fallback(
+            self.qmd,
             root,
-            query.strip(),
-            mode=mode,
-            limit=fetch_limit,
-            min_score=float(min_score) if min_score is not None else None,
-            full=full,
+            req,
+            fetch_limit=fetch_limit,
+            semantic_ready=semantic_ready,
+            limiter=self.hybrid_limiter,
         )
-        results = filter_results(normalize_search_payload(raw), prefix, limit)
-        return Response.json(
-            200,
-            {
-                "user_id": user_id,
-                "mode": mode,
-                "query": query.strip(),
-                "path": prefix,
-                "results": results,
-            },
-        )
+        results = filter_results(normalize_search_payload(raw), prefix, req.limit)
+        payload: dict[str, Any] = {
+            "user_id": user_id,
+            "mode": req.mode,
+            "query": req.query,
+            "path": prefix,
+            "rerank": req.rerank,
+            "min_score": req.min_score,
+            "candidate_limit": req.candidate_limit,
+            "results": results,
+        }
+        if req.intent:
+            payload["intent"] = req.intent
+        if req.searches:
+            payload["searches"] = [{"type": item.type, "query": item.query} for item in req.searches]
+        if fallback:
+            payload["fallback"] = fallback
+        if index:
+            payload["keyword_search_ready"] = index.get("keyword_search_ready")
+            payload["semantic_search_ready"] = index.get("semantic_search_ready")
+            uses_semantic = req.mode in {"vsearch", "query"} or any(item.type in {"vec", "hyde"} for item in req.searches)
+            if uses_semantic and not index.get("semantic_search_ready"):
+                payload["hint"] = index.get("hint")
+        return Response.json(200, payload)
 
     def _get_document(self, user_id: str, query: dict[str, list[str]]) -> Response:
         spec = (query.get("path") or [None])[0]
@@ -366,6 +422,9 @@ class App:
         max_lines = _opt_int(query, "max_lines")
         if max_lines is None:
             max_lines = _opt_int(query, "count")
+        max_bytes = _opt_int(query, "max_bytes")
+        if max_bytes is None:
+            max_bytes = DEFAULT_MAX_BYTES
         line_numbers = _opt_bool(query, "line_numbers", default=True)
         root = ensure_user_tree(self.settings.data_root, user_id, self.qmd)
         try:
@@ -375,12 +434,134 @@ class App:
                 from_line=from_line,
                 max_lines=max_lines,
                 line_numbers=line_numbers,
+                max_bytes=max_bytes,
+                qmd=self.qmd,
+            )
+        except DocumentNotFound as exc:
+            return Response.json(
+                404,
+                {
+                    "error": "not_found",
+                    "message": "document not found",
+                    "path": exc.spec,
+                    "similar": exc.similar,
+                },
             )
         except FileNotFoundError:
-            return Response.error(404, "not_found", "document not found")
+            return Response.json(
+                404,
+                {
+                    "error": "not_found",
+                    "message": "document not found",
+                    "similar": similar_paths(root, spec.strip()),
+                },
+            )
         except UnicodeDecodeError as exc:
             raise ValueError("document is not utf-8 text") from exc
         return Response.json(200, {"user_id": user_id, "document": doc})
+
+    def _multi_get(self, user_id: str, body: bytes) -> Response:
+        try:
+            obj = json.loads(body.decode("utf-8") or "{}")
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("invalid JSON body") from exc
+        if not isinstance(obj, dict):
+            raise ValueError("JSON body must be an object")
+        raw_files = obj.get("files", obj.get("pattern"))
+        tokens = _parse_file_list(raw_files)
+        if not tokens:
+            raise ValueError("files is required")
+        from_line = obj.get("from_line", obj.get("fromLine"))
+        max_lines = obj.get("max_lines", obj.get("maxLines"))
+        max_bytes = obj.get("max_bytes", obj.get("maxBytes", DEFAULT_MAX_BYTES))
+        if from_line is not None and (not isinstance(from_line, int) or from_line < 1):
+            raise ValueError("from_line must be an integer >= 1")
+        if max_lines is not None and (not isinstance(max_lines, int) or max_lines < 1):
+            raise ValueError("max_lines must be an integer >= 1")
+        if max_bytes is not None and (not isinstance(max_bytes, int) or max_bytes < 1):
+            raise ValueError("max_bytes must be an integer >= 1")
+        line_numbers = obj.get("line_numbers", obj.get("lineNumbers", True))
+        if not isinstance(line_numbers, bool):
+            raise ValueError("line_numbers must be a boolean")
+        path_raw = obj.get("path")
+        if path_raw is not None and not isinstance(path_raw, str):
+            raise ValueError("path must be a string")
+        prefix = parse_folder_scope(path_raw)
+        root = ensure_user_tree(self.settings.data_root, user_id, self.qmd)
+        documents: list[dict[str, Any]] = []
+        errors: list[dict[str, Any]] = []
+        for token in tokens:
+            if len(documents) >= MAX_MULTI_FILES:
+                errors.append({"file": token, "error": "too_many", "message": f"truncated at {MAX_MULTI_FILES} files"})
+                break
+            if any(ch in token for ch in "*?["):
+                matches = expand_glob(root, token, prefix)
+                if not matches:
+                    errors.append(
+                        {
+                            "file": token,
+                            "error": "not_found",
+                            "message": "no files matched",
+                            "similar": similar_paths(root, token.replace("**", "").replace("*", ""), prefix=prefix),
+                        }
+                    )
+                    continue
+                specs = matches
+                glob_scope = True
+            else:
+                specs = [token]
+                glob_scope = False
+            for spec in specs:
+                if len(documents) >= MAX_MULTI_FILES:
+                    break
+                try:
+                    rel, docid, suf_from, suf_count = parse_document_ref(spec)
+                except PathError as exc:
+                    errors.append({"file": spec, "error": "bad_path", "message": str(exc)})
+                    continue
+                if rel and prefix and not glob_scope and not path_under_prefix(rel, prefix):
+                    # Explicit paths may sit outside path (caller pin + mentions).
+                    pass
+                if rel and prefix and glob_scope and not path_under_prefix(rel, prefix):
+                    continue
+                locator = spec if not rel else rel
+                if suf_from or suf_count:
+                    locator = spec
+                try:
+                    doc = read_markdown(
+                        root,
+                        locator,
+                        from_line=from_line if from_line is not None else suf_from,
+                        max_lines=max_lines if max_lines is not None else suf_count,
+                        line_numbers=line_numbers,
+                        max_bytes=max_bytes,
+                        qmd=self.qmd,
+                    )
+                except DocumentNotFound as exc:
+                    errors.append(
+                        {
+                            "file": exc.spec,
+                            "error": "not_found",
+                            "message": "document not found",
+                            "similar": exc.similar,
+                        }
+                    )
+                    continue
+                except (FileNotFoundError, UnicodeDecodeError, ValueError, PathError) as exc:
+                    errors.append({"file": locator, "error": "error", "message": str(exc)})
+                    continue
+                if prefix and doc.get("path") and not path_under_prefix(str(doc["path"]), prefix) and not docid and glob_scope:
+                    continue
+                documents.append(doc)
+        return Response.json(
+            200,
+            {
+                "user_id": user_id,
+                "path": prefix,
+                "documents": documents,
+                "errors": errors,
+            },
+        )
 
     def _list_tasks(self, user_id: str, query: dict[str, list[str]]) -> Response:
         status = (query.get("status") or [None])[0]
@@ -393,6 +574,16 @@ class App:
             return Response.error(404, "not_found", "task not found")
         return Response.json(200, {"task": task_public(row)})
 
+
+
+def _parse_file_list(raw: Any) -> list[str]:
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        return [item.strip() for item in raw if isinstance(item, str) and item.strip()]
+    if isinstance(raw, str):
+        return [part.strip() for part in raw.split(",") if part.strip()]
+    raise ValueError("files must be a string or array of strings")
 
 def _opt_int(query: dict[str, list[str]], name: str) -> int | None:
     raw = (query.get(name) or [None])[0]

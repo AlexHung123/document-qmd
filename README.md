@@ -70,8 +70,11 @@ X-User-Id: alice
 | GET | `/v1/files` | 要 | 該用戶檔案列表 |
 | GET | `/v1/files/{id}` | 要 | 檔案 + 任務 |
 | GET | `/v1/files/{id}/content?tree=inbox\|markdown` | 要 | 原檔或已轉 md |
-| POST | `/v1/search` | 要 | 即時代查，唔入隊列；可選 `path` 限資料夾 |
-| GET | `/v1/documents?path=` | 要 | 讀該用戶 `markdown/` 下一個檔（可加 `:from:count`） |
+| POST | `/v1/search` | 要 | 即時代查，唔入隊列；可選 `path` 限資料夾；可用 `searches`（lex/vec/hyde）、`intent`、`rerank`（預設關）、`minScore`、`candidateLimit`；混合搜尋逾時或未就緒會自動退回關鍵字 |
+| GET | `/v1/status` | 要 | 索引狀態：`qmd update`/`embed` 完未、keyword/semantic 是否可用、collection context |
+| GET | `/v1/context` | 要 | 呢個用戶嘅 collection / folder context |
+| GET | `/v1/documents?path=` | 要 | 讀檔；`path` 可以係相對路徑、`#docid`，或帶 `:from:count`；找不到會回 `similar` |
+| POST | `/v1/documents/multi` | 要 | 一次讀多個路徑、`#docid`、或遞迴 glob（`**/*.md`）；可選 `max_bytes` |
 | GET | `/v1/tasks` | 要 | 該用戶任務 |
 | GET | `/v1/tasks/{id}` | 要 | 單一任務 |
 
@@ -138,7 +141,30 @@ curl -s http://127.0.0.1:8787/v1/search \
   -d '{"query":"季度規劃","mode":"search","limit":10}'
 ```
 
-`mode`：`search`（預設，BM25，快）、`vsearch`、`query`（hybrid + rerank，會載入本地 LLM）。只查該用戶嘅庫。
+舊嘅 `{ query, mode, limit, path }` 仍然可用。結構化查詢請把 `lex` / `vec` / `hyde` 分開送來，唔好先收成一句：
+
+```bash
+curl -s http://127.0.0.1:8787/v1/search \
+  -H "X-User-Id: alice" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "intent": "Find the quarterly OKR note",
+    "searches": [
+      {"type": "lex", "query": "OKR quarterly plan"},
+      {"type": "vec", "query": "how the team set quarterly objectives"},
+      {"type": "hyde", "query": "A note describes the quarterly OKR plan."}
+    ],
+    "limit": 10,
+    "rerank": true,
+    "minScore": 0.2,
+    "candidateLimit": 40,
+    "path": "contracts/2024"
+  }'
+```
+
+Dochub 會把 typed lines 原樣組成 qmd query document（`intent:` / `lex:` / `vec:` / `hyde:`），再交給 `qmd query`。純 lex、冇 intent 時仍走 `qmd search`（BM25，embed 未完成都可以用）。若只傳一句 `query` 而 `mode` 係 `query`，伺服器會補上 `lex:` + `vec:`（有 `intent` 就一併寫入），避免 qmd 再做 LLM 查詢擴展。`rerank` 預設關閉，會加 `--no-rerank`，只做 RRF 融合；要 cross-encoder 重排時先傳 `rerank: true`。`minScore` / `candidateLimit` 對應 qmd 嘅 `--min-score` 同 `--candidate-limit`。
+
+`mode`：`search`（BM25，快）、`vsearch`、`query`（hybrid RRF；重排預設關）。只查該用戶嘅庫。`qmd query` / `vsearch` 預設 20 秒超時（`DOCHUB_SEARCH_TIMEOUT`），關鍵字搜尋預設 30 秒（`DOCHUB_KEYWORD_SEARCH_TIMEOUT`）。同一行程同一時間只跑一個混合查詢；排唔到、逾時、qmd 失敗、或語意未就緒時，會喺同一個用戶根目錄自動改打 `qmd search`，回傳帶 `fallback: { "reason", "mode": "search" }`（`reason` 可以係 `timeout`、`busy`、`qmd_exec_failed`、`semantic_not_ready`、`parse_failed`）。傳 `fallback: false` 可關閉自動後備。回傳仍會帶 `keyword_search_ready` / `semantic_search_ready`；語意未就緒時亦會有 `hint`。
 
 限資料夾（markdown 相對路徑，前綴匹配）：
 
@@ -151,13 +177,31 @@ curl -s http://127.0.0.1:8787/v1/search \
 
 每條結果會帶 `dochub_path`（例如 `contracts/2024/report.md`）。QMD 本身冇 folder filter，本服務會 over-fetch 再按路徑前綴篩。
 
-讀正文（MCP `get` 用呢條）：
+讀正文（MCP `get` 用呢條）。支援行位同索引 docid；找不到會回相近路徑：
 
 ```bash
 curl -s "http://127.0.0.1:8787/v1/documents?path=contracts/2024/report.md" \
   -H "X-User-Id: alice"
 curl -s "http://127.0.0.1:8787/v1/documents?path=contracts/2024/report.md:120:40" \
   -H "X-User-Id: alice"
+curl -s "http://127.0.0.1:8787/v1/documents?path=%23abc123" \
+  -H "X-User-Id: alice"
+```
+
+一次讀多個（遞迴 glob、docid 清單、`max_bytes`）：
+
+```bash
+curl -s http://127.0.0.1:8787/v1/documents/multi \
+  -H "X-User-Id: alice" \
+  -H "Content-Type: application/json" \
+  -d '{"files":["contracts/**/*.md","#abc123"],"max_bytes":204800}'
+```
+
+索引狀態同 collection context：
+
+```bash
+curl -s http://127.0.0.1:8787/v1/status -H "X-User-Id: alice"
+curl -s http://127.0.0.1:8787/v1/context -H "X-User-Id: alice"
 ```
 
 ## Per-user MCP（pi-agent-core）

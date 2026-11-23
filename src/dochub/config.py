@@ -36,7 +36,8 @@ class Settings:
     worker_poll_seconds: float = 0.4
     update_timeout_seconds: int = 300
     embed_timeout_seconds: int = 1800
-    search_timeout_seconds: int = 180
+    search_timeout_seconds: int = 20
+    keyword_search_timeout_seconds: int = 30
 
     @property
     def users_root(self) -> Path:
@@ -59,5 +60,6 @@ class Settings:
             worker_poll_seconds=_env_float("DOCHUB_WORKER_POLL_SECONDS", 0.4),
             update_timeout_seconds=_env_int("DOCHUB_UPDATE_TIMEOUT", 300),
             embed_timeout_seconds=_env_int("DOCHUB_EMBED_TIMEOUT", 1800),
-            search_timeout_seconds=_env_int("DOCHUB_SEARCH_TIMEOUT", 180),
+            search_timeout_seconds=_env_int("DOCHUB_SEARCH_TIMEOUT", 20),
+            keyword_search_timeout_seconds=_env_int("DOCHUB_KEYWORD_SEARCH_TIMEOUT", 30),
         )

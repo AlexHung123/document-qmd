@@ -9,6 +9,7 @@ from dochub.scope import (
     filter_results,
     overfetch_limit,
     parse_document_path,
+    parse_document_ref,
     parse_folder_scope,
     parse_markdown_relpath,
     path_under_prefix,
@@ -35,11 +36,15 @@ class ScopeTests(unittest.TestCase):
         self.assertEqual(path, "a.md")
         self.assertEqual((start, count), (10, 5))
 
-    def test_docid_rejected_as_folder_and_document(self):
+    def test_docid_rejected_as_folder_accepted_as_document(self):
         with self.assertRaises(PathError):
             parse_folder_scope("#abc")
         with self.assertRaises(PathError):
-            parse_document_path("#abc")
+            parse_document_path("#abc123")
+        rel, docid, start, count = parse_document_ref("#abc123:120:40")
+        self.assertIsNone(rel)
+        self.assertEqual(docid, "#abc123")
+        self.assertEqual((start, count), (120, 40))
 
     def test_traversal_rejected(self):
         with self.assertRaises(PathError):
