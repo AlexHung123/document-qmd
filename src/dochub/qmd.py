@@ -45,7 +45,11 @@ class QmdRunner:
 
     def _env(self, user_root: Path) -> dict[str, str]:
         env = os.environ.copy()
+        # Official qmd honors INDEX_PATH, QMD_CONFIG_DIR, and XDG_CONFIG_HOME.
+        # Drop host/process values so this user's project-local .qmd is used.
         env.pop("INDEX_PATH", None)
+        env.pop("QMD_CONFIG_DIR", None)
+        env.pop("XDG_CONFIG_HOME", None)
         env["QMD_TRUST_LOCAL_CONFIG"] = "1"
         # qmd init uses process.env.PWD || process.cwd(). Inherit PWD from the
         # parent shell and it writes the index into the repo instead of the user root.

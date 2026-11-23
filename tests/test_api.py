@@ -275,6 +275,51 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(calls[0][2], "hello")
         self.assertEqual(calls[0][3]["mode"], "search")
 
+    def test_search_does_not_fallback_after_historical_failed_ingest(self):
+        first = self.app.handle(
+            "POST",
+            "/v1/files",
+            self._headers(),
+            _file_body(markdown="# old", relative="docs/old.md"),
+        )
+        self.assertEqual(first.status, 202)
+        failed_id = json.loads(first.body)["task"]["id"]
+        claimed = self.app.store.claim()
+        self.assertEqual(claimed.id, failed_id)
+        self.app.store.fail(failed_id, "embed boom", permanent=True)
+
+        second = self.app.handle(
+            "POST",
+            "/v1/files",
+            self._headers(),
+            _file_body(markdown="# hello", relative="docs/note.md"),
+        )
+        self.assertEqual(second.status, 202)
+        later_id = json.loads(second.body)["task"]["id"]
+        claimed = self.app.store.claim()
+        self.assertEqual(claimed.id, later_id)
+        self.app.store.set_stage(later_id, "qmd_embed")
+        self.app.store.succeed(later_id)
+
+        self.qmd.status_payload = {
+            "totalDocuments": 2,
+            "needsEmbedding": 0,
+            "hasVectorIndex": True,
+            "collections": [{"name": "markdown", "documents": 2}],
+        }
+        resp = self.app.handle(
+            "POST",
+            "/v1/search",
+            self._headers(),
+            json.dumps({"query": "hello", "mode": "query"}).encode(),
+        )
+        self.assertEqual(resp.status, 200)
+        payload = json.loads(resp.body)
+        self.assertTrue(payload["semantic_search_ready"])
+        self.assertNotIn("fallback", payload)
+        modes = [c[3]["mode"] for c in self.qmd.calls if c[0] == "search"]
+        self.assertEqual(modes, ["query"])
+
     def test_search_falls_back_on_timeout(self):
         from dochub.qmd import QmdError
 
