@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "dochub": {
+      "command": "python3",
+      "args": ["-m", "dochub", "mcp"],
+      "exposure": "direct",
+      "description": "Search and read this user's indexed documents",
+      "env": {
+        "PYTHONPATH": "/absolute/path/to/documents/src",
+        "PYTHONUNBUFFERED": "1",
+        "DOCHUB_URL": "http://127.0.0.1:8787",
+        "DOCHUB_USER_ID": "${DOCHUB_USER_ID}"
+      }
+    }
+  }
+}

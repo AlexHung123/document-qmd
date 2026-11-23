@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.dochub</string>
+  <key>WorkingDirectory</key>
+  <string>/Users/admin/Projects/documents</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/python3</string>
+    <string>-m</string>
+    <string>dochub</string>
+    <string>serve</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/bin:/bin</string>
+    <key>PYTHONPATH</key>
+    <string>/Users/admin/Projects/documents/src</string>
+    <key>DOCHUB_DATA_ROOT</key>
+    <string>/Users/admin/Documents/dochub</string>
+    <key>DOCHUB_BIND</key>
+    <string>127.0.0.1</string>
+    <key>DOCHUB_PORT</key>
+    <string>8787</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/Users/admin/Library/Logs/dochub.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/admin/Library/Logs/dochub.err.log</string>
+</dict>
+</plist>
