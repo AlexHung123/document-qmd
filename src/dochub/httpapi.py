@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from .config import Settings
 from .convert import merge_front_matter
@@ -47,7 +48,75 @@ from .searchrun import HybridLimiter, search_with_fallback
 from .tree import build_inbox_tree, create_folder
 from .util import atomic_write_bytes, atomic_write_text, new_id, sha256_bytes, utcnow_iso
 
+
 MAX_JSON_BODY = 2 * 1024 * 1024
+
+_FILENAME_STAR_RE = re.compile(r"filename\*\s*=\s*([^']*)''([^;]+)", re.I)
+_FILENAME_QUOTED_RE = re.compile(r'filename\s*=\s*"((?:\\.|[^"\\])*)"', re.I)
+_FILENAME_TOKEN_RE = re.compile(r"filename\s*=\s*([^;]+)", re.I)
+
+
+def _header_basename(filename: str) -> str:
+    name = str(filename).replace("\\", "/").split("/")[-1]
+    name = name.replace("\r", "").replace("\n", "").strip()
+    return name or "download"
+
+
+def _ascii_fallback_filename(name: str) -> str:
+    path = Path(name)
+    stem = path.stem or name
+    suffix = path.suffix
+
+    def clean(part: str, empty: str) -> str:
+        chars: list[str] = []
+        for ch in part:
+            if ch.isascii() and ch not in '"\\/' and 32 <= ord(ch) < 127:
+                chars.append(ch)
+            else:
+                chars.append("_")
+        cleaned = re.sub(r"_+", "_", "".join(chars)).strip(" ._")
+        return cleaned or empty
+
+    fallback = clean(stem, "download")
+    if suffix:
+        ext = clean(suffix.lstrip("."), "")
+        if ext:
+            fallback += "." + ext
+    return fallback or "download"
+
+
+def content_disposition(filename: str) -> str:
+    name = _header_basename(filename)
+    fallback = _ascii_fallback_filename(name)
+    escaped = fallback.replace("\\", "\\\\").replace('"', '\\"')
+    value = f'attachment; filename="{escaped}"'
+    if name != fallback:
+        value += f"; filename*=UTF-8''{quote(name, safe='')}"
+    return value
+
+
+def _filename_from_disposition(value: str) -> str:
+    match = _FILENAME_STAR_RE.search(value)
+    if match:
+        return unquote(match.group(2).strip())
+    match = _FILENAME_QUOTED_RE.search(value)
+    if match:
+        return match.group(1).replace('\\"', '"').replace("\\\\", "\\")
+    match = _FILENAME_TOKEN_RE.search(value)
+    if match:
+        return match.group(1).strip().strip('"')
+    return value
+
+
+def latin1_header_value(key: str, value: str) -> str:
+    cleaned = str(value).replace("\r", "").replace("\n", "")
+    try:
+        cleaned.encode("latin-1")
+        return cleaned
+    except UnicodeEncodeError:
+        if key.lower() == "content-disposition":
+            return content_disposition(_filename_from_disposition(value))
+        return cleaned.encode("latin-1", "replace").decode("latin-1")
 
 
 def user_id_from_headers(headers: dict[str, str]) -> str:
@@ -76,7 +145,7 @@ class Response:
     def bytes(cls, status: int, data: bytes, content_type: str, filename: str | None = None) -> Response:
         headers = {"Content-Type": content_type}
         if filename:
-            headers["Content-Disposition"] = f'attachment; filename="{filename}"'
+            headers["Content-Disposition"] = content_disposition(filename)
         return cls(status, data, headers)
 
 
@@ -655,7 +724,7 @@ def make_handler(app: App) -> type[BaseHTTPRequestHandler]:
         def _write(self, response: Response) -> None:
             self.send_response(response.status)
             for key, value in response.headers.items():
-                self.send_header(key, value)
+                self.send_header(key, latin1_header_value(key, value))
             self.send_header("Content-Length", str(len(response.body)))
             self.send_header("Connection", "close")
             self.end_headers()

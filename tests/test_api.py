@@ -5,8 +5,10 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from urllib.parse import unquote
 
 import support
+from dochub.httpapi import content_disposition, latin1_header_value
 
 
 def _file_body(filename="a.md", content=b"# a", markdown="# a", relative=None):
@@ -18,6 +20,19 @@ def _file_body(filename="a.md", content=b"# a", markdown="# a", relative=None):
     if relative is not None:
         body["relative_path"] = relative
     return json.dumps(body).encode()
+
+
+def _send_header_line(keyword: str, value: str) -> bytes:
+    return ("%s: %s\r\n" % (keyword, value)).encode("latin-1", "strict")
+
+
+def _filename_from_star(header: str) -> str:
+    marker = "filename*=UTF-8''"
+    start = header.lower().find(marker.lower())
+    if start < 0:
+        raise AssertionError(f"filename* missing from {header!r}")
+    token = header[start + len(marker) :].split(";")[0].strip()
+    return unquote(token)
 
 
 class ApiTests(unittest.TestCase):
@@ -434,3 +449,75 @@ class ApiTests(unittest.TestCase):
         payload = json.loads(resp.body)
         paths = sorted(doc["path"] for doc in payload["documents"])
         self.assertEqual(paths, ["docs/a.md", "docs/sub/b.md"])
+
+    def test_content_download_non_ascii_filename(self):
+        filename = "季度報告.pdf"
+        resp = self.app.handle(
+            "POST",
+            "/v1/files",
+            self._headers(),
+            _file_body(
+                filename=filename,
+                content=b"%PDF",
+                markdown="# 報告",
+                relative="docs/季度報告.pdf",
+            ),
+        )
+        self.assertEqual(resp.status, 202)
+        file_id = json.loads(resp.body)["file"]["id"]
+
+        inbox = self.app.handle("GET", f"/v1/files/{file_id}/content", self._headers(), b"")
+        self.assertEqual(inbox.status, 200)
+        self.assertEqual(inbox.body, b"%PDF")
+        inbox_disp = inbox.headers["Content-Disposition"]
+        _send_header_line("Content-Disposition", inbox_disp)
+        self.assertEqual(_filename_from_star(inbox_disp), filename)
+
+        markdown = self.app.handle(
+            "GET",
+            f"/v1/files/{file_id}/content?tree=markdown",
+            self._headers(),
+            b"",
+        )
+        self.assertEqual(markdown.status, 200)
+        self.assertIn("# 報告", markdown.body.decode("utf-8"))
+        md_disp = markdown.headers["Content-Disposition"]
+        _send_header_line("Content-Disposition", md_disp)
+        self.assertEqual(_filename_from_star(md_disp), "季度報告.md")
+
+
+class ContentDispositionTests(unittest.TestCase):
+    def test_ascii_filename_needs_no_star(self):
+        value = content_disposition("notes.pdf")
+        _send_header_line("Content-Disposition", value)
+        self.assertEqual(value, 'attachment; filename="notes.pdf"')
+        self.assertNotIn("filename*", value)
+
+    def test_non_ascii_filename_uses_rfc5987(self):
+        name = "季度報告.pdf"
+        value = content_disposition(name)
+        _send_header_line("Content-Disposition", value)
+        self.assertIn('filename="download.pdf"', value)
+        self.assertEqual(_filename_from_star(value), name)
+
+    def test_strips_crlf_path_components_and_quotes(self):
+        value = content_disposition('dir/evil\r\nX-Injected: 1".md')
+        _send_header_line("Content-Disposition", value)
+        self.assertNotIn("\r", value)
+        self.assertNotIn("\n", value)
+        line = _send_header_line("Content-Disposition", value).decode("latin-1")
+        self.assertEqual(line.count("\r\n"), 1)
+        self.assertEqual(_filename_from_star(value), 'evilX-Injected: 1".md')
+
+    def test_latin1_header_value_rewrites_unsafe_content_disposition(self):
+        naive = 'attachment; filename="季度報告.pdf"'
+        with self.assertRaises(UnicodeEncodeError):
+            _send_header_line("Content-Disposition", naive)
+        fixed = latin1_header_value("Content-Disposition", naive)
+        _send_header_line("Content-Disposition", fixed)
+        self.assertEqual(_filename_from_star(fixed), "季度報告.pdf")
+
+    def test_latin1_header_value_replaces_other_unsafe_headers(self):
+        value = latin1_header_value("X-Name", "季度報告")
+        _send_header_line("X-Name", value)
+        self.assertNotEqual(value, "季度報告")
