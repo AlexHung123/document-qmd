@@ -5,6 +5,7 @@ import os
 import re
 from pathlib import Path
 
+from .library import public_root
 from .paths import (
     chmod_private_dir,
     inbox_dir,
@@ -43,6 +44,27 @@ def ensure_user_tree(data_root: Path, user_id: str, qmd) -> Path:
     """
     uid = parse_user_id(user_id)
     root = user_root(data_root, uid)
+    chmod_private_dir(root)
+    chmod_private_dir(inbox_dir(root))
+    chmod_private_dir(markdown_dir(root))
+    chmod_private_dir(qmd_dir(root))
+    _ensure_index_yml(qmd_dir(root) / "index.yml", markdown_dir(root))
+    qmd.init_index(root)
+    sqlite = qmd_dir(root) / "index.sqlite"
+    if not sqlite.exists():
+        raise LayoutError(f"qmd init did not create {sqlite}")
+    return root
+
+
+def ensure_public_tree(data_root: Path, qmd) -> Path:
+    """Create the shared public library root and its own QMD index.
+
+    Layout (sibling of users/, never mixed into a user tree):
+      public/inbox/      original shared uploads
+      public/markdown/   shared .md (the only tree this index covers)
+      public/.qmd/       public index.yml + index.sqlite
+    """
+    root = public_root(data_root)
     chmod_private_dir(root)
     chmod_private_dir(inbox_dir(root))
     chmod_private_dir(markdown_dir(root))

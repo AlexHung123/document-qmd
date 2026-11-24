@@ -9,7 +9,17 @@ from urllib.parse import parse_qs, urlparse
 
 from .config import Settings
 from .convert import merge_front_matter
-from .layout import ensure_user_tree
+from .layout import ensure_public_tree, ensure_user_tree
+from .library import (
+    LIBRARY_PRIVATE,
+    LIBRARY_PUBLIC,
+    PUBLIC_OWNER_ID,
+    ForbiddenError,
+    annotate_wiki_flags,
+    can_write_public,
+    is_public_owner,
+    parse_library,
+)
 from .log import log
 from .multipart import MultipartError, parse_multipart
 from .paths import (
@@ -87,6 +97,36 @@ class App:
         self.qmd = qmd
         self.hybrid_limiter = HybridLimiter()
 
+    def _can_write_public(self, user_id: str) -> bool:
+        return can_write_public(self.settings.public_curators, user_id)
+
+    def _open_library(self, user_id: str, library: str, *, write: bool) -> tuple[Path, str]:
+        """Return (tree root, control-plane owner id) for a library.
+
+        Public writes require the caller to be in DOCHUB_PUBLIC_CURATORS.
+        Public files are owned by PUBLIC_OWNER_ID, never the uploader's private id.
+        """
+        if library == LIBRARY_PUBLIC:
+            if write and not self._can_write_public(user_id):
+                raise ForbiddenError("public library is read-only for this user")
+            return ensure_public_tree(self.settings.data_root, self.qmd), PUBLIC_OWNER_ID
+        return ensure_user_tree(self.settings.data_root, user_id, self.qmd), user_id
+
+    def _library_from_query(self, query: dict[str, list[str]]) -> str:
+        raw = (query.get("library") or query.get("visibility") or [None])[0]
+        return parse_library(raw)
+
+    def _library_from_obj(self, obj: dict[str, Any]) -> str:
+        return parse_library(obj.get("library") or obj.get("visibility"))
+
+    def _file_visible(self, row: FileRow, user_id: str) -> bool:
+        return row.user_id == user_id or is_public_owner(row.user_id)
+
+    def _root_for_owner(self, owner_id: str) -> Path:
+        if is_public_owner(owner_id):
+            return ensure_public_tree(self.settings.data_root, self.qmd)
+        return ensure_user_tree(self.settings.data_root, owner_id, self.qmd)
+
     def handle(self, method: str, path: str, headers: dict[str, str], body: bytes) -> Response:
         parsed = urlparse(path)
         route = parsed.path
@@ -98,11 +138,18 @@ class App:
                 return self._health(headers)
             user_id = user_id_from_headers(headers)
             if method == "GET" and route == "/v1/me":
-                return Response.json(200, {"user_id": user_id})
+                return Response.json(
+                    200,
+                    {
+                        "user_id": user_id,
+                        "can_write_public": can_write_public(self.settings.public_curators, user_id),
+                        "libraries": [LIBRARY_PRIVATE, LIBRARY_PUBLIC],
+                    },
+                )
             if method == "GET" and route == "/v1/status":
-                return self._status(user_id)
+                return self._status(user_id, query)
             if method == "GET" and route == "/v1/context":
-                return self._context(user_id)
+                return self._context(user_id, query)
             if method == "POST" and route == "/v1/files":
                 return self._upload(user_id, headers, body)
             if method == "POST" and route == "/v1/folders":
@@ -110,7 +157,7 @@ class App:
             if method == "GET" and route == "/v1/tree":
                 return self._tree(user_id, query)
             if method == "GET" and route == "/v1/files":
-                return self._list_files(user_id)
+                return self._list_files(user_id, query)
             if method == "GET" and route.startswith("/v1/files/"):
                 return self._file_routes(user_id, route, query)
             if method == "POST" and route == "/v1/search":
@@ -124,6 +171,8 @@ class App:
             if method == "GET" and route.startswith("/v1/tasks/"):
                 return self._get_task(user_id, route.rsplit("/", 1)[-1])
             return Response.error(404, "not_found", "unknown route")
+        except ForbiddenError as exc:
+            return Response.error(403, "forbidden", str(exc))
         except PathError as exc:
             return Response.error(400, "bad_path", str(exc))
         except MultipartError as exc:
@@ -149,16 +198,18 @@ class App:
                 log("index status failed", error=str(exc), user_id=user_id)
         return Response.json(200, body)
 
-    def _index_status(self, user_id: str) -> dict[str, Any]:
-        root = ensure_user_tree(self.settings.data_root, user_id, self.qmd)
-        return build_index_status(self.store, user_id, root, self.qmd)
+    def _index_status(self, user_id: str, library: str = LIBRARY_PRIVATE) -> dict[str, Any]:
+        root, owner = self._open_library(user_id, library, write=False)
+        return build_index_status(self.store, owner, root, self.qmd)
 
-    def _status(self, user_id: str) -> Response:
-        index = self._index_status(user_id)
+    def _status(self, user_id: str, query: dict[str, list[str]] | None = None) -> Response:
+        library = self._library_from_query(query or {})
+        index = self._index_status(user_id, library)
         body = {
             "ok": True,
             "service": "dochub",
             "user_id": user_id,
+            "library": library,
             "qmd": self.qmd.available(),
             "index": index,
             "keyword_search_ready": index.get("keyword_search_ready"),
@@ -169,20 +220,25 @@ class App:
         }
         return Response.json(200, body)
 
-    def _context(self, user_id: str) -> Response:
-        index = self._index_status(user_id)
-        return Response.json(200, {"user_id": user_id, "contexts": index.get("contexts") or []})
+    def _context(self, user_id: str, query: dict[str, list[str]] | None = None) -> Response:
+        library = self._library_from_query(query or {})
+        index = self._index_status(user_id, library)
+        return Response.json(
+            200,
+            {"user_id": user_id, "library": library, "contexts": index.get("contexts") or []},
+        )
 
     def _upload(self, user_id: str, headers: dict[str, str], body: bytes) -> Response:
         content_type = headers.get("Content-Type") or headers.get("content-type") or ""
-        filename, file_bytes, markdown_text, relative_path, declared_type = self._parse_upload(content_type, body)
+        filename, file_bytes, markdown_text, relative_path, declared_type, library_raw = self._parse_upload(content_type, body)
+        library = parse_library(library_raw)
         if not file_bytes:
             return Response.error(400, "empty_file", "upload is empty")
         if not markdown_text or not markdown_text.strip():
             return Response.error(400, "markdown_required", "markdown is required")
         if len(file_bytes) > self.settings.max_upload_bytes:
             return Response.error(413, "too_large", "file exceeds max upload size")
-        root = ensure_user_tree(self.settings.data_root, user_id, self.qmd)
+        root, owner = self._open_library(user_id, library, write=True)
         inbox = inbox_dir(root)
         md_root = markdown_dir(root)
         if relative_path:
@@ -215,7 +271,7 @@ class App:
             "content_type": declared_type,
         }
         file_row, task_row = self.store.insert_upload(
-            user_id=user_id,
+            user_id=owner,
             original_filename=filename,
             content_type=declared_type,
             sha256=sha256_bytes(file_bytes),
@@ -244,7 +300,7 @@ class App:
 
     def _parse_upload(
         self, content_type: str, body: bytes
-    ) -> tuple[str, bytes, str | None, str | None, str | None]:
+    ) -> tuple[str, bytes, str | None, str | None, str | None, str | None]:
         lowered = content_type.lower()
         if lowered.startswith("multipart/form-data"):
             parts = parse_multipart(content_type, body)
@@ -262,7 +318,12 @@ class App:
             declared = file_part.content_type
             if "content_type" in parts and parts["content_type"].data:
                 declared = parts["content_type"].data.decode("utf-8").strip() or declared
-            return filename, file_part.data, markdown_text, relative, declared
+            library_raw = None
+            if "library" in parts and parts["library"].data:
+                library_raw = parts["library"].data.decode("utf-8").strip() or None
+            elif "visibility" in parts and parts["visibility"].data:
+                library_raw = parts["visibility"].data.decode("utf-8").strip() or None
+            return filename, file_part.data, markdown_text, relative, declared, library_raw
         if lowered.startswith("application/json"):
             try:
                 obj = json.loads(body.decode("utf-8"))
@@ -296,7 +357,10 @@ class App:
             declared = obj.get("content_type")
             if declared is not None and not isinstance(declared, str):
                 raise ValueError("content_type must be a string")
-            return filename, file_bytes, markdown_text, relative, declared
+            library_raw = obj.get("library", obj.get("visibility"))
+            if library_raw is not None and not isinstance(library_raw, str):
+                raise ValueError("library must be a string")
+            return filename, file_bytes, markdown_text, relative, declared, library_raw
         raise ValueError("Content-Type must be multipart/form-data or application/json")
 
     def _create_folder(self, user_id: str, body: bytes) -> Response:
@@ -309,24 +373,28 @@ class App:
         path = obj.get("path")
         if not isinstance(path, str) or not path.strip():
             raise ValueError("path is required")
-        root = ensure_user_tree(self.settings.data_root, user_id, self.qmd)
+        library = self._library_from_obj(obj)
+        root, _owner = self._open_library(user_id, library, write=True)
         rel = create_folder(root, path.strip())
-        log("folder created", user_id=user_id, path=rel)
-        return Response.json(200, {"path": rel})
+        log("folder created", user_id=user_id, library=library, path=rel)
+        return Response.json(200, {"path": rel, "library": library, "wiki": False})
 
     def _tree(self, user_id: str, query: dict[str, list[str]]) -> Response:
-        root = ensure_user_tree(self.settings.data_root, user_id, self.qmd)
+        library = self._library_from_query(query)
+        root, owner = self._open_library(user_id, library, write=False)
         prefix = (query.get("path") or [None])[0] or None
-        files = self.store.list_files(user_id, limit=10000)
+        files = self.store.list_files(owner, limit=10000)
         try:
-            tree = build_inbox_tree(root, files, prefix=prefix)
+            tree = annotate_wiki_flags(build_inbox_tree(root, files, prefix=prefix), root)
         except FileNotFoundError:
             return Response.error(404, "not_found", "folder not found")
-        return Response.json(200, {"user_id": user_id, "tree": tree})
+        return Response.json(200, {"user_id": user_id, "library": library, "tree": tree})
 
-    def _list_files(self, user_id: str) -> Response:
-        rows = self.store.list_files(user_id)
-        return Response.json(200, {"files": [file_public(r) for r in rows]})
+    def _list_files(self, user_id: str, query: dict[str, list[str]] | None = None) -> Response:
+        library = self._library_from_query(query or {})
+        _root, owner = self._open_library(user_id, library, write=False)
+        rows = self.store.list_files(owner)
+        return Response.json(200, {"library": library, "files": [file_public(r) for r in rows]})
 
     def _file_routes(self, user_id: str, route: str, query: dict[str, list[str]]) -> Response:
         rest = route[len("/v1/files/") :]
@@ -337,17 +405,17 @@ class App:
 
     def _get_file(self, user_id: str, file_id: str) -> Response:
         row = self.store.get_file(file_id)
-        if row is None or row.user_id != user_id:
+        if row is None or not self._file_visible(row, user_id):
             return Response.error(404, "not_found", "file not found")
         task = self.store.get_task(row.task_id) if row.task_id else None
         return Response.json(200, {"file": file_public(row), "task": task_public(task) if task else None})
 
     def _file_content(self, user_id: str, file_id: str, query: dict[str, list[str]]) -> Response:
         row = self.store.get_file(file_id)
-        if row is None or row.user_id != user_id:
+        if row is None or not self._file_visible(row, user_id):
             return Response.error(404, "not_found", "file not found")
         tree = (query.get("tree") or ["inbox"])[0]
-        root = ensure_user_tree(self.settings.data_root, user_id, self.qmd)
+        root = self._root_for_owner(row.user_id)
         if tree == "inbox":
             path = safe_join(inbox_dir(root), row.inbox_relpath)
             if not path.is_file():
@@ -370,13 +438,14 @@ class App:
         if not isinstance(obj, dict):
             raise ValueError("JSON body must be an object")
         req = parse_search_body(obj)
+        library = self._library_from_obj(obj)
         prefix = parse_folder_scope(req.path)
-        root = ensure_user_tree(self.settings.data_root, user_id, self.qmd)
+        root, owner = self._open_library(user_id, library, write=False)
         index = None
         try:
-            index = build_index_status(self.store, user_id, root, self.qmd)
+            index = build_index_status(self.store, owner, root, self.qmd)
         except Exception as exc:
-            log("index status failed", error=str(exc), user_id=user_id)
+            log("index status failed", error=str(exc), user_id=user_id, library=library)
         fetch_limit = overfetch_limit(req.limit, scoped=prefix is not None)
         semantic_ready = None if index is None else bool(index.get("semantic_search_ready"))
         raw, fallback = search_with_fallback(
@@ -390,6 +459,7 @@ class App:
         results = filter_results(normalize_search_payload(raw), prefix, req.limit)
         payload: dict[str, Any] = {
             "user_id": user_id,
+            "library": library,
             "mode": req.mode,
             "query": req.query,
             "path": prefix,
@@ -426,7 +496,8 @@ class App:
         if max_bytes is None:
             max_bytes = DEFAULT_MAX_BYTES
         line_numbers = _opt_bool(query, "line_numbers", default=True)
-        root = ensure_user_tree(self.settings.data_root, user_id, self.qmd)
+        library = self._library_from_query(query)
+        root, _owner = self._open_library(user_id, library, write=False)
         try:
             doc = read_markdown(
                 root,
@@ -458,7 +529,7 @@ class App:
             )
         except UnicodeDecodeError as exc:
             raise ValueError("document is not utf-8 text") from exc
-        return Response.json(200, {"user_id": user_id, "document": doc})
+        return Response.json(200, {"user_id": user_id, "library": library, "document": doc})
 
     def _multi_get(self, user_id: str, body: bytes) -> Response:
         try:
@@ -487,7 +558,8 @@ class App:
         if path_raw is not None and not isinstance(path_raw, str):
             raise ValueError("path must be a string")
         prefix = parse_folder_scope(path_raw)
-        root = ensure_user_tree(self.settings.data_root, user_id, self.qmd)
+        library = self._library_from_obj(obj)
+        root, _owner = self._open_library(user_id, library, write=False)
         documents: list[dict[str, Any]] = []
         errors: list[dict[str, Any]] = []
         for token in tokens:
@@ -557,6 +629,7 @@ class App:
             200,
             {
                 "user_id": user_id,
+                "library": library,
                 "path": prefix,
                 "documents": documents,
                 "errors": errors,
@@ -565,12 +638,16 @@ class App:
 
     def _list_tasks(self, user_id: str, query: dict[str, list[str]]) -> Response:
         status = (query.get("status") or [None])[0]
-        rows = self.store.list_tasks(user_id=user_id, status=status)
-        return Response.json(200, {"tasks": [task_public(r) for r in rows]})
+        library = self._library_from_query(query)
+        _root, owner = self._open_library(user_id, library, write=False)
+        rows = self.store.list_tasks(user_id=owner, status=status)
+        return Response.json(200, {"library": library, "tasks": [task_public(r) for r in rows]})
 
     def _get_task(self, user_id: str, task_id: str) -> Response:
         row = self.store.get_task(task_id)
-        if row is None or row.user_id != user_id:
+        if row is None:
+            return Response.error(404, "not_found", "task not found")
+        if row.user_id != user_id and not is_public_owner(row.user_id):
             return Response.error(404, "not_found", "task not found")
         return Response.json(200, {"task": task_public(row)})
 
@@ -606,6 +683,7 @@ def file_public(row: FileRow) -> dict[str, Any]:
     return {
         "id": row.id,
         "user_id": row.user_id,
+        "library": LIBRARY_PUBLIC if is_public_owner(row.user_id) else LIBRARY_PRIVATE,
         "original_filename": row.original_filename,
         "content_type": row.content_type,
         "sha256": row.sha256,
@@ -621,6 +699,7 @@ def task_public(row: TaskRow) -> dict[str, Any]:
     return {
         "id": row.id,
         "user_id": row.user_id,
+        "library": LIBRARY_PUBLIC if is_public_owner(row.user_id) else LIBRARY_PRIVATE,
         "kind": row.kind,
         "file_id": row.file_id,
         "status": row.status,

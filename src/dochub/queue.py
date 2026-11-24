@@ -232,6 +232,57 @@ class ControlStore:
         assert file_row and task_row
         return file_row, task_row
 
+    def insert_registered_file(
+        self,
+        *,
+        user_id: str,
+        original_filename: str,
+        content_type: str | None,
+        sha256: str,
+        size_bytes: int,
+        inbox_relpath: str,
+        markdown_relpath: str | None,
+        file_id: str | None = None,
+    ) -> FileRow:
+        """Register a file already on disk, without enqueueing an ingest task.
+
+        Used by public-library seed so a large tree can be indexed once
+        rather than once per file.
+        """
+        file_id = file_id or new_id()
+        now = utcnow_iso()
+        with self.transaction() as db:
+            db.execute(
+                """
+                INSERT INTO files(
+                  id, user_id, original_filename, content_type, sha256, size_bytes,
+                  inbox_relpath, markdown_relpath, provided_markdown_relpath, created_at, task_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL)
+                """,
+                (
+                    file_id,
+                    user_id,
+                    original_filename,
+                    content_type,
+                    sha256,
+                    size_bytes,
+                    inbox_relpath,
+                    markdown_relpath,
+                    now,
+                ),
+            )
+        row = self.get_file(file_id)
+        assert row
+        return row
+
+    def get_file_by_inbox(self, user_id: str, inbox_relpath: str) -> FileRow | None:
+        with self._lock:
+            row = self._db.execute(
+                "SELECT * FROM files WHERE user_id=? AND inbox_relpath=?",
+                (user_id, inbox_relpath),
+            ).fetchone()
+        return _row_file(row) if row else None
+
     def get_file(self, file_id: str) -> FileRow | None:
         with self._lock:
             row = self._db.execute("SELECT * FROM files WHERE id=?", (file_id,)).fetchone()

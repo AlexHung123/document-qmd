@@ -14,6 +14,19 @@
     markdown/                   # 前端交嚟嘅 .md；QMD 只索引呢度
     .qmd/index.yml              # 呢個用戶自己嘅 QMD 設定
     .qmd/index.sqlite           # 呢個用戶自己嘅 QMD 庫（唔用 ~/.cache/qmd/index.sqlite）
+  public/                       # 所有已登入用戶共用嘅資料庫（唔係公開到外網）
+    inbox/
+    markdown/
+    .qmd/index.yml
+    .qmd/index.sqlite           # 同任何用戶嘅 private sqlite 完全分開
+```
+
+Public 寫入（`POST /v1/folders`、`POST /v1/files` 加上 `library=public`）只准 `DOCHUB_PUBLIC_CURATORS` 裏面嘅 user id（逗號分隔）。名單空白就冇人可以寫 public。讀取只要有 `X-User-Id`。搜尋、讀檔、樹一律用 `library=private|public`（或 `visibility`），預設 private。唔好把兩套索引倒進同一個 sqlite。
+
+把現有政策文件拷進 public（唔刪來源）：
+
+```bash
+PYTHONPATH=src python3 -m dochub seed-public --from /path/to/spr --folder spr --index
 ```
 
 ## 流程
@@ -36,6 +49,8 @@ export DOCHUB_DATA_ROOT="$HOME/Documents/dochub"
 # 內網可改 bind；預設只聽 127.0.0.1
 # export DOCHUB_BIND=127.0.0.1
 # export DOCHUB_PORT=8787
+# 可寫 public 資料夾嘅 curator（逗號分隔 user id）；空白則無人可寫
+# export DOCHUB_PUBLIC_CURATORS="1,alice"
 
 PYTHONPATH=src python3 -m dochub serve
 ```
@@ -55,7 +70,7 @@ PYTHONPATH=src python3 -m dochub worker
 X-User-Id: alice
 ```
 
-`user_id` 只可以係 `A-Za-z0-9._@+-`，最長 128。檔案永遠寫入 `users/<X-User-Id>/`。
+`user_id` 只可以係 `A-Za-z0-9._@+-`，最長 128。Private 檔案寫入 `users/<X-User-Id>/`。Public 檔案寫入 `public/`，隊列裏面用保留 owner `__public__`，唔好當成某個用戶嘅私人檔。
 
 ## HTTP
 

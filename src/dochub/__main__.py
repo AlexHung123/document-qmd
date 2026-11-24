@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 import os
 import sys
 import threading
 
 from .config import Settings
 from .httpapi import App, serve_http
-from .layout import ensure_user_tree, list_user_ids
+from .layout import ensure_public_tree, ensure_user_tree, list_user_ids
+from .library import public_root
 from .log import log
+from .seed import seed_public_folder
 from .mcp import run_mcp
 from .paths import parse_user_id
 from .qmd import QmdRunner
@@ -96,7 +99,31 @@ def cmd_check(args: argparse.Namespace) -> int:
     print(f"users={len(users)}")
     for uid in users:
         print(f"  {uid} {settings.users_root / uid}")
+    pub = public_root(settings.data_root)
+    print(f"public={pub} exists={pub.is_dir()}")
+    print(f"public_curators={list(settings.public_curators)}")
     store.close()
+    return 0
+
+
+def cmd_seed_public(args: argparse.Namespace) -> int:
+    settings = build_settings(args)
+    settings.data_root.mkdir(parents=True, exist_ok=True)
+    store = ControlStore(settings.queue_db)
+    qmd = QmdRunner(settings)
+    try:
+        result = seed_public_folder(
+            settings.data_root,
+            Path(args.source),
+            args.folder,
+            store,
+            qmd,
+            hidden=bool(args.hidden),
+            run_index=bool(args.index),
+        )
+    finally:
+        store.close()
+    print(result)
     return 0
 
 
@@ -124,6 +151,16 @@ def main(argv: list[str] | None = None) -> int:
 
     check = sub.add_parser("check", help="Print data root, queue counts, users")
     check.set_defaults(func=cmd_check)
+
+    seed = sub.add_parser(
+        "seed-public",
+        help="Copy a local document tree into the shared public library (does not delete the source)",
+    )
+    seed.add_argument("--from", dest="source", required=True, help="Source directory to copy")
+    seed.add_argument("--folder", required=True, help="Public folder name, e.g. spr")
+    seed.add_argument("--hidden", action="store_true", help="Mark as hidden from default pickers (recorded in the result only)")
+    seed.add_argument("--index", action="store_true", help="Run qmd update and embed once on the public root")
+    seed.set_defaults(func=cmd_seed_public)
 
     mcp = sub.add_parser("mcp", help="Per-user MCP stdio server for pi-agent-core")
     mcp.add_argument("--url", help="Dochub HTTP URL (default DOCHUB_URL or http://127.0.0.1:8787)")

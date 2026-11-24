@@ -3,7 +3,8 @@ from __future__ import annotations
 import threading
 
 from .config import Settings
-from .layout import ensure_user_tree
+from .layout import ensure_public_tree, ensure_user_tree
+from .library import is_public_owner
 from .log import log
 from .qmd import QmdError, QmdRunner
 from .queue import ControlStore, TaskRow
@@ -67,7 +68,10 @@ class Worker:
             raise PermanentError(f"file {task.file_id} not found")
         if not file_row.markdown_relpath:
             raise PermanentError("markdown missing; upload must include markdown")
-        root = ensure_user_tree(self.settings.data_root, task.user_id, self.qmd)
+        if is_public_owner(task.user_id):
+            root = ensure_public_tree(self.settings.data_root, self.qmd)
+        else:
+            root = ensure_user_tree(self.settings.data_root, task.user_id, self.qmd)
         if task.stage == "convert":
             self.store.set_stage(task.id, "qmd_update")
             task.stage = "qmd_update"
