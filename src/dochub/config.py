@@ -4,6 +4,8 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from .library import parse_curators
+
 
 DEFAULT_DATA_ROOT = Path.home() / "Documents" / "dochub"
 DEFAULT_PORT = 8787
@@ -38,6 +40,9 @@ class Settings:
     embed_timeout_seconds: int = 1800
     search_timeout_seconds: int = 20
     keyword_search_timeout_seconds: int = 30
+    # User ids allowed to create or upload into the shared public library.
+    # From DOCHUB_PUBLIC_CURATORS (comma-separated). Empty = no public writes.
+    public_curators: tuple[str, ...] = ()
 
     @property
     def users_root(self) -> Path:
@@ -62,4 +67,5 @@ class Settings:
             embed_timeout_seconds=_env_int("DOCHUB_EMBED_TIMEOUT", 1800),
             search_timeout_seconds=_env_int("DOCHUB_SEARCH_TIMEOUT", 20),
             keyword_search_timeout_seconds=_env_int("DOCHUB_KEYWORD_SEARCH_TIMEOUT", 30),
+            public_curators=parse_curators(os.environ.get("DOCHUB_PUBLIC_CURATORS")),
         )
