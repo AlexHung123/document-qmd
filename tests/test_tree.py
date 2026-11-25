@@ -69,6 +69,9 @@ class TreeTests(unittest.TestCase):
         report = next(c for c in year["children"] if c["name"] == "report.pdf")
         self.assertEqual(report["type"], "file")
         self.assertEqual(report["file"]["id"], file_id)
+        self.assertEqual(report["file"]["size_bytes"], 4)
+        self.assertEqual(report["file"]["inbox_size_bytes"], 4)
+        self.assertGreaterEqual(report["file"]["markdown_size_bytes"], len("# report"))
 
     def test_tree_prefix(self):
         self.app.handle("POST", "/v1/folders", self._headers(), json.dumps({"path": "a/b"}).encode())
