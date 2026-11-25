@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import fnmatch
 import os
 import re
 from difflib import SequenceMatcher
@@ -111,11 +110,12 @@ def glob_match(path: str, pattern: str) -> bool:
     pat = pattern.replace("\\", "/").lstrip("/")
     if pat.startswith("markdown/"):
         pat = pat[len("markdown/") :]
-    if fnmatch.fnmatch(path, pat):
+    rx = glob_to_regex(pat)
+    if rx.fullmatch(path):
         return True
-    if "/" not in pat.rstrip("/") and fnmatch.fnmatch(path.rsplit("/", 1)[-1], pat):
-        return True
-    return glob_to_regex(pat).fullmatch(path) is not None
+    if "/" not in pat.rstrip("/"):
+        return rx.fullmatch(path.rsplit("/", 1)[-1]) is not None
+    return False
 
 
 def expand_glob(user_root: Path, pattern: str, prefix: str | None = None) -> list[str]:
@@ -163,12 +163,13 @@ def read_markdown(
     line_numbers: bool = True,
     max_bytes: int | None = DEFAULT_MAX_BYTES,
     qmd=None,
+    prefix: str | None = None,
 ) -> dict[str, Any]:
     rel, docid, suf_from, suf_count = parse_document_ref(spec)
     if docid:
         rel = _resolve_docid_path(user_root, docid, qmd)
         if not rel:
-            raise DocumentNotFound(docid, similar_paths(user_root, docid))
+            raise DocumentNotFound(docid, similar_paths(user_root, docid, prefix=prefix))
     if not rel:
         raise PathError("document path is required")
     start = from_line if from_line is not None else suf_from
@@ -177,7 +178,7 @@ def read_markdown(
     if path.is_dir():
         raise PathError("path is a directory")
     if not path.is_file():
-        raise DocumentNotFound(rel, similar_paths(user_root, rel))
+        raise DocumentNotFound(rel, similar_paths(user_root, rel, prefix=prefix))
     size = path.stat().st_size
     if max_bytes is not None and start is None and count is None and size > max_bytes:
         # Still return a sliced prefix rather than skipping the file entirely.

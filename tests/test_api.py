@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import tempfile
 import unittest
@@ -98,6 +99,56 @@ class ApiTests(unittest.TestCase):
         got = self.app.handle("GET", f"/v1/files/{file_id}", self._headers("bob"), b"")
         self.assertEqual(got.status, 404)
 
+    def test_upload_conflict_when_inbox_path_already_registered(self):
+        first = self.app.handle(
+            "POST",
+            "/v1/files",
+            self._headers(),
+            _file_body(filename="note.pdf", content=b"AAAA", markdown="# a", relative="docs/note.pdf"),
+        )
+        self.assertEqual(first.status, 202)
+        first_id = json.loads(first.body)["file"]["id"]
+        inbox = self.data / "users" / "alice" / "inbox" / "docs" / "note.pdf"
+        markdown = self.data / "users" / "alice" / "markdown" / "docs" / "note.md"
+        inbox.unlink()
+        markdown.unlink()
+        second = self.app.handle(
+            "POST",
+            "/v1/files",
+            self._headers(),
+            _file_body(filename="note.pdf", content=b"BBBB", markdown="# b", relative="docs/note.pdf"),
+        )
+        self.assertEqual(second.status, 409)
+        self.assertEqual(json.loads(second.body)["error"], "conflict")
+        self.assertFalse(inbox.exists())
+        row = self.app.store.get_file(first_id)
+        self.assertIsNotNone(row)
+        self.assertEqual(row.sha256, hashlib.sha256(b"AAAA").hexdigest())
+        self.assertEqual(len(self.app.store.list_files("alice")), 1)
+
+    def test_second_upload_same_path_is_renamed(self):
+        first = self.app.handle(
+            "POST",
+            "/v1/files",
+            self._headers(),
+            _file_body(filename="note.pdf", content=b"AAAA", markdown="# a", relative="docs/note.pdf"),
+        )
+        second = self.app.handle(
+            "POST",
+            "/v1/files",
+            self._headers(),
+            _file_body(filename="note.pdf", content=b"BBBB", markdown="# b", relative="docs/note.pdf"),
+        )
+        self.assertEqual(first.status, 202)
+        self.assertEqual(second.status, 202)
+        first_rel = json.loads(first.body)["file"]["inbox_relpath"]
+        second_rel = json.loads(second.body)["file"]["inbox_relpath"]
+        self.assertEqual(first_rel, "docs/note.pdf")
+        self.assertNotEqual(second_rel, first_rel)
+        inbox = self.data / "users" / "alice" / "inbox"
+        self.assertEqual((inbox / first_rel).read_bytes(), b"AAAA")
+        self.assertEqual((inbox / second_rel).read_bytes(), b"BBBB")
+
     def test_path_traversal_rejected(self):
         resp = self.app.handle(
             "POST",
@@ -143,6 +194,22 @@ class ApiTests(unittest.TestCase):
     def test_invalid_user_id(self):
         resp = self.app.handle("GET", "/v1/me", {"X-User-Id": "../alice"}, b"")
         self.assertEqual(resp.status, 400)
+
+    def test_dot_and_dotdot_user_id_do_not_escape_users_dir(self):
+        for user in (".", ".."):
+            resp = self.app.handle("GET", "/v1/tree", {"X-User-Id": user}, b"")
+            self.assertEqual(resp.status, 400, user)
+            self.assertEqual(json.loads(resp.body)["error"], "bad_path")
+        self.assertFalse((self.data / "inbox").exists())
+        self.assertFalse((self.data / "markdown").exists())
+        self.assertFalse((self.data / ".qmd").exists())
+        self.assertFalse((self.data / "users" / "inbox").exists())
+
+    def test_reserved_public_owner_is_not_a_user_id(self):
+        resp = self.app.handle("GET", "/v1/tree", {"X-User-Id": "__public__"}, b"")
+        self.assertEqual(resp.status, 400)
+        self.assertEqual(json.loads(resp.body)["error"], "bad_path")
+        self.assertFalse((self.data / "users" / "__public__").exists())
 
     def test_search_path_filter(self):
         self.qmd.search_results = [
@@ -449,6 +516,55 @@ class ApiTests(unittest.TestCase):
         payload = json.loads(resp.body)
         paths = sorted(doc["path"] for doc in payload["documents"])
         self.assertEqual(paths, ["docs/a.md", "docs/sub/b.md"])
+
+    def test_multi_get_single_star_does_not_recurse(self):
+        self.app.handle(
+            "POST",
+            "/v1/files",
+            self._headers(),
+            _file_body(markdown="# a", relative="docs/a.md"),
+        )
+        self.app.handle(
+            "POST",
+            "/v1/files",
+            self._headers(),
+            _file_body(markdown="# b", relative="docs/sub/b.md"),
+        )
+        resp = self.app.handle(
+            "POST",
+            "/v1/documents/multi",
+            self._headers(),
+            json.dumps({"files": ["docs/*.md"], "line_numbers": False}).encode(),
+        )
+        self.assertEqual(resp.status, 200)
+        payload = json.loads(resp.body)
+        paths = sorted(doc["path"] for doc in payload["documents"])
+        self.assertEqual(paths, ["docs/a.md"])
+
+    def test_multi_get_similar_stays_under_path_prefix(self):
+        self.app.handle(
+            "POST",
+            "/v1/files",
+            self._headers(),
+            _file_body(markdown="# contract", relative="contracts/keep.md"),
+        )
+        self.app.handle(
+            "POST",
+            "/v1/files",
+            self._headers(),
+            _file_body(markdown="# invoice", relative="invoices/note.md"),
+        )
+        resp = self.app.handle(
+            "POST",
+            "/v1/documents/multi",
+            self._headers(),
+            json.dumps({"files": ["contracts/note.md"], "path": "contracts"}).encode(),
+        )
+        self.assertEqual(resp.status, 200)
+        errors = json.loads(resp.body)["errors"]
+        self.assertTrue(errors)
+        similar = errors[0].get("similar") or []
+        self.assertNotIn("invoices/note.md", similar)
 
     def test_content_download_non_ascii_filename(self):
         filename = "季度報告.pdf"

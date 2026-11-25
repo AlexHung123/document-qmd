@@ -14,6 +14,15 @@ STATUSES = ("pending", "running", "succeeded", "failed")
 STAGES = ("qmd_update", "qmd_embed")
 
 
+class DuplicateInboxPath(Exception):
+    """(user_id, inbox_relpath) is already registered."""
+
+    def __init__(self, user_id: str, inbox_relpath: str):
+        super().__init__(f"file already exists at {inbox_relpath}")
+        self.user_id = user_id
+        self.inbox_relpath = inbox_relpath
+
+
 @dataclass
 class FileRow:
     id: str
@@ -197,40 +206,48 @@ class ControlStore:
         file_id = file_id or new_id()
         task_id = task_id or new_id()
         now = utcnow_iso()
-        with self.transaction() as db:
-            db.execute(
-                """
-                INSERT INTO files(
-                  id, user_id, original_filename, content_type, sha256, size_bytes,
-                  inbox_relpath, markdown_relpath, provided_markdown_relpath, created_at, task_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
-                """,
-                (
-                    file_id,
-                    user_id,
-                    original_filename,
-                    content_type,
-                    sha256,
-                    size_bytes,
-                    inbox_relpath,
-                    markdown_relpath,
-                    now,
-                    task_id,
-                ),
-            )
-            db.execute(
-                """
-                INSERT INTO tasks(
-                  id, user_id, kind, file_id, status, stage, attempts, max_attempts,
-                  run_after, last_error, payload, created_at, updated_at, started_at, finished_at
-                ) VALUES (?, ?, 'ingest', ?, 'pending', 'qmd_update', 0, ?, ?, NULL, ?, ?, ?, NULL, NULL)
-                """,
-                (task_id, user_id, file_id, max_attempts, now, json_dumps(payload), now, now),
-            )
+        try:
+            with self.transaction() as db:
+                db.execute(
+                    """
+                    INSERT INTO files(
+                      id, user_id, original_filename, content_type, sha256, size_bytes,
+                      inbox_relpath, markdown_relpath, provided_markdown_relpath, created_at, task_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+                    """,
+                    (
+                        file_id,
+                        user_id,
+                        original_filename,
+                        content_type,
+                        sha256,
+                        size_bytes,
+                        inbox_relpath,
+                        markdown_relpath,
+                        now,
+                        task_id,
+                    ),
+                )
+                db.execute(
+                    """
+                    INSERT INTO tasks(
+                      id, user_id, kind, file_id, status, stage, attempts, max_attempts,
+                      run_after, last_error, payload, created_at, updated_at, started_at, finished_at
+                    ) VALUES (?, ?, 'ingest', ?, 'pending', 'qmd_update', 0, ?, ?, NULL, ?, ?, ?, NULL, NULL)
+                    """,
+                    (task_id, user_id, file_id, max_attempts, now, json_dumps(payload), now, now),
+                )
+        except sqlite3.IntegrityError as exc:
+            raise DuplicateInboxPath(user_id, inbox_relpath) from exc
         file_row = self.get_file(file_id)
         task_row = self.get_task(task_id)
         assert file_row and task_row
         return file_row, task_row
+
+    def delete_upload(self, file_id: str) -> None:
+        with self.transaction() as db:
+            db.execute("DELETE FROM tasks WHERE file_id=?", (file_id,))
+            db.execute("DELETE FROM files WHERE id=?", (file_id,))
 
     def insert_registered_file(
         self,

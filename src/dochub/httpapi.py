@@ -44,7 +44,7 @@ from .documents import (
 )
 from .indexstatus import build_index_status
 from .qmd import QmdError, QmdRunner
-from .queue import ControlStore, FileRow, TaskRow
+from .queue import ControlStore, DuplicateInboxPath, FileRow, TaskRow
 from .scope import (
     filter_results,
     normalize_search_payload,
@@ -60,6 +60,11 @@ from .util import atomic_write_bytes, atomic_write_text, new_id, sha256_bytes, u
 
 
 MAX_JSON_BODY = 2 * 1024 * 1024
+
+
+class BodyTooLarge(Exception):
+    """Request Content-Length exceeds the configured body cap."""
+
 
 _FILENAME_STAR_RE = re.compile(r"filename\*\s*=\s*([^']*)''([^;]+)", re.I)
 _FILENAME_QUOTED_RE = re.compile(r'filename\s*=\s*"((?:\\.|[^"\\])*)"', re.I)
@@ -319,8 +324,6 @@ class App:
         if dest_probe.exists() and dest_probe.is_dir():
             return Response.error(409, "is_directory", "relative_path is an existing folder")
         rel = unique_relpath(inbox, rel, file_id)
-        dest = safe_join(inbox, rel)
-        atomic_write_bytes(dest, file_bytes)
         md_rel = unique_relpath(md_root, markdown_relpath_for(rel), file_id)
         md_body = merge_front_matter(
             markdown_text,
@@ -332,25 +335,33 @@ class App:
                 "dochub_uploaded_at": utcnow_iso(),
             },
         )
-        atomic_write_text(safe_join(md_root, md_rel), md_body)
         payload = {
             "inbox_relpath": rel,
             "markdown_relpath": md_rel,
             "original_filename": filename,
             "content_type": declared_type,
         }
-        file_row, task_row = self.store.insert_upload(
-            user_id=owner,
-            original_filename=filename,
-            content_type=declared_type,
-            sha256=sha256_bytes(file_bytes),
-            size_bytes=len(file_bytes),
-            inbox_relpath=rel,
-            markdown_relpath=md_rel,
-            max_attempts=self.settings.max_attempts,
-            payload=payload,
-            file_id=file_id,
-        )
+        try:
+            file_row, task_row = self.store.insert_upload(
+                user_id=owner,
+                original_filename=filename,
+                content_type=declared_type,
+                sha256=sha256_bytes(file_bytes),
+                size_bytes=len(file_bytes),
+                inbox_relpath=rel,
+                markdown_relpath=md_rel,
+                max_attempts=self.settings.max_attempts,
+                payload=payload,
+                file_id=file_id,
+            )
+        except DuplicateInboxPath:
+            return Response.error(409, "conflict", "file already exists at this relative_path")
+        try:
+            atomic_write_bytes(safe_join(inbox, rel), file_bytes)
+            atomic_write_text(safe_join(md_root, md_rel), md_body)
+        except Exception:
+            self.store.delete_upload(file_id)
+            raise
         log(
             "upload stored",
             user_id=user_id,
@@ -677,6 +688,7 @@ class App:
                         line_numbers=line_numbers,
                         max_bytes=max_bytes,
                         qmd=self.qmd,
+                        prefix=prefix,
                     )
                 except DocumentNotFound as exc:
                     errors.append(
@@ -796,8 +808,7 @@ def make_handler(app: App) -> type[BaseHTTPRequestHandler]:
             if length < 0:
                 raise ValueError("invalid Content-Length")
             if length > app.settings.max_upload_bytes + MAX_JSON_BODY:
-                self._write(Response.error(413, "too_large", "request body too large"))
-                return b""
+                raise BodyTooLarge
             return self.rfile.read(length) if length else b""
 
         def _write(self, response: Response) -> None:
@@ -812,6 +823,9 @@ def make_handler(app: App) -> type[BaseHTTPRequestHandler]:
         def _dispatch(self, method: str) -> None:
             try:
                 body = self._read_body()
+            except BodyTooLarge:
+                self._write(Response.error(413, "too_large", "request body too large"))
+                return
             except Exception:
                 self._write(Response.error(400, "bad_request", "cannot read body"))
                 return

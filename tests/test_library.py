@@ -42,6 +42,8 @@ class LibraryParseTests(unittest.TestCase):
         self.assertEqual(parse_curators("alice, bob,alice"), ("alice", "bob"))
         with self.assertRaises(PathError):
             parse_curators("../alice")
+        with self.assertRaises(PathError):
+            parse_curators("__public__")
 
     def test_can_write_public(self):
         self.assertFalse(can_write_public((), "alice"))

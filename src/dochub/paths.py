@@ -10,6 +10,9 @@ from .util import utcnow
 
 USER_ID_RE = re.compile(r"^[A-Za-z0-9._@+-]{1,128}$")
 CONTROL_CHARS = set(range(32))
+# Reserved control-plane owner for the shared public library. Never a users/<id>/.
+PUBLIC_OWNER_ID = "__public__"
+RESERVED_USER_IDS = frozenset({".", "..", PUBLIC_OWNER_ID})
 
 
 class PathError(ValueError):
@@ -19,11 +22,19 @@ class PathError(ValueError):
 def parse_user_id(raw: str) -> str:
     if not isinstance(raw, str) or not USER_ID_RE.fullmatch(raw):
         raise PathError("invalid user_id")
+    if raw in RESERVED_USER_IDS:
+        raise PathError("invalid user_id")
     return raw
 
 
 def user_root(data_root: Path, user_id: str) -> Path:
-    return (data_root / "users" / parse_user_id(user_id)).resolve()
+    uid = parse_user_id(user_id)
+    data = data_root.resolve()
+    users = (data / "users").resolve()
+    root = (users / uid).resolve()
+    if root.parent != users or root.name != uid:
+        raise PathError("invalid user_id")
+    return root
 
 
 def inbox_dir(root: Path) -> Path:
@@ -103,18 +114,21 @@ def default_inbox_relpath(filename: str, now: datetime | None = None) -> str:
 
 def unique_relpath(root: Path, rel: str, file_id: str) -> str:
     rel = normalize_relative_path(rel)
-    target = safe_join(root, rel)
-    if not target.exists():
+    if not safe_join(root, rel).exists():
         return rel
     path = Path(rel)
     suffix = path.suffix
     stem = path.stem
     parent = str(path.parent).replace("\\", "/")
     extra = file_id.replace("-", "")[:8]
-    name = f"{stem}-{extra}{suffix}"
-    if parent in ("", "."):
-        return name
-    return f"{parent}/{name}"
+    n = 0
+    while n < 1000:
+        name = f"{stem}-{extra}{suffix}" if n == 0 else f"{stem}-{extra}-{n}{suffix}"
+        candidate = name if parent in ("", ".") else f"{parent}/{name}"
+        if not safe_join(root, candidate).exists():
+            return candidate
+        n += 1
+    raise PathError("could not allocate a unique relative_path")
 
 
 def markdown_relpath_for(inbox_relpath: str) -> str:

@@ -196,22 +196,6 @@ def compose_query(args: dict[str, Any]) -> tuple[str, str]:
     )
 
 
-def _glob_match(path: str, pattern: str) -> bool:
-    import fnmatch
-
-    pat = pattern.replace("\\", "/")
-    if fnmatch.fnmatch(path, pat):
-        return True
-    if "/" not in pat.rstrip("/") and fnmatch.fnmatch(path.rsplit("/", 1)[-1], pat):
-        return True
-    if "**" in pat:
-        import re
-
-        relaxed = re.escape(pat).replace(r"\*\*", ".*").replace(r"\*", "[^/]*").replace(r"\?", ".")
-        return re.fullmatch(relaxed, path) is not None
-    return False
-
-
 def tool_definitions(folder: str | None) -> list[dict[str, Any]]:
     pin = f" Session is pinned to folder `{folder}`." if folder else ""
     return [
@@ -378,6 +362,12 @@ class McpSession:
         self.folder = parse_folder_scope(folder)
         self.tools = {item["name"]: item for item in tool_definitions(self.folder)}
 
+    def _similar_under_pin(self, similar: Any) -> list[str]:
+        names = [item for item in similar if isinstance(item, str)] if isinstance(similar, list) else []
+        if not self.folder:
+            return names
+        return [item for item in names if path_under_prefix(item, self.folder)]
+
     def instructions(self) -> str:
         pin = f" Folder pin: `{self.folder}` (all tools stay inside it)." if self.folder else ""
         return (
@@ -520,12 +510,19 @@ class McpSession:
             raise ValueError("lineNumbers must be a boolean")
         rel, docid, suf_from, suf_count = parse_document_ref(file.strip())
         locator = docid or constrain_to_pin(rel, self.folder)
-        payload = self.client.get_document(
-            locator,
-            from_line=from_line if from_line is not None else suf_from,
-            max_lines=max_lines if max_lines is not None else suf_count,
-            line_numbers=line_numbers,
-        )
+        try:
+            payload = self.client.get_document(
+                locator,
+                from_line=from_line if from_line is not None else suf_from,
+                max_lines=max_lines if max_lines is not None else suf_count,
+                line_numbers=line_numbers,
+            )
+        except DochubApiError as exc:
+            similar = self._similar_under_pin(exc.payload.get("similar") if isinstance(exc.payload, dict) else None)
+            msg = str(exc)
+            if similar:
+                msg += f" (similar: {', '.join(similar)})"
+            return _text_result(msg, is_error=True)
         doc = payload.get("document") if isinstance(payload, dict) else None
         if not isinstance(doc, dict):
             return _text_result("document not found", is_error=True)
@@ -578,6 +575,9 @@ class McpSession:
                 else:
                     errors.append({"file": rel or "?", "error": "outside_pin", "message": "path is outside the pinned folder"})
             documents = kept
+            for item in errors:
+                if isinstance(item, dict) and "similar" in item:
+                    item["similar"] = self._similar_under_pin(item.get("similar"))
         chunks = [f"{doc.get('path')}\n---\n{doc.get('text') or ''}" for doc in documents if isinstance(doc, dict)]
         err_lines = []
         for item in errors:

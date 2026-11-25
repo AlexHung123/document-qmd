@@ -119,13 +119,13 @@ class PublicApiTests(unittest.TestCase):
         # Worker indexes public files against the public root, not alice's private tree.
         self.assertTrue(self.worker.process_one())
         self.assertTrue(self.worker.process_one())
+        public_root = (self.data / "public").resolve()
+        alice_root = (self.data / "users" / "alice").resolve()
         public_updates = [
-            c for c in self.qmd.calls if c[0] == "update" and Path(c[1]) == self.data / "public"
+            c for c in self.qmd.calls if c[0] == "update" and Path(c[1]).resolve() == public_root
         ]
         private_updates = [
-            c
-            for c in self.qmd.calls
-            if c[0] == "update" and Path(c[1]) == self.data / "users" / "alice"
+            c for c in self.qmd.calls if c[0] == "update" and Path(c[1]).resolve() == alice_root
         ]
         self.assertEqual(len(public_updates), 1)
         self.assertEqual(len(private_updates), 1)
@@ -143,7 +143,7 @@ class PublicApiTests(unittest.TestCase):
         public_payload = json.loads(public_search.body)
         self.assertEqual(public_payload["library"], "public")
         search_cwds = [c[1] for c in self.qmd.calls if c[0] == "search"]
-        self.assertEqual(Path(search_cwds[-1]), self.data / "public")
+        self.assertEqual(Path(search_cwds[-1]).resolve(), public_root)
 
         self.qmd.search_results = [
             {"file": "qmd://markdown/notes/secret.md", "title": "secret", "score": 1},
@@ -157,7 +157,7 @@ class PublicApiTests(unittest.TestCase):
         self.assertEqual(private_search.status, 200)
         # Bob's private search must run in bob's tree, not alice's and not public.
         search_cwds = [c[1] for c in self.qmd.calls if c[0] == "search"]
-        self.assertEqual(Path(search_cwds[-1]), self.data / "users" / "bob")
+        self.assertEqual(Path(search_cwds[-1]).resolve(), (self.data / "users" / "bob").resolve())
 
     def test_bob_cannot_read_alice_private_file_but_can_read_public(self):
         priv = self.app.handle(

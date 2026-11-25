@@ -125,6 +125,25 @@ class McpTests(unittest.TestCase):
         self.assertTrue(all(p.startswith("contracts") for p in paths))
         self.assertNotIn("invoices/b.md", paths)
 
+    def test_folder_pin_similar_hides_sibling_paths(self):
+        pinned = McpSession(self.client, folder="contracts")
+        multi = _call_tool(pinned, "multi_get", {"files": ["contracts/b.md"]})
+        self.assertTrue(multi["result"]["isError"])
+        multi_text = multi["result"]["content"][0]["text"]
+        self.assertNotIn("invoices/b.md", multi_text)
+        multi_errors = multi["result"]["structuredContent"]["errors"]
+        similar = []
+        for item in multi_errors:
+            similar.extend(item.get("similar") or [])
+        self.assertIn("contracts/a.md", similar)
+        self.assertNotIn("invoices/b.md", similar)
+
+        missed = _call_tool(pinned, "get", {"file": "contracts/b.md"})
+        self.assertTrue(missed["result"]["isError"])
+        get_text = missed["result"]["content"][0]["text"]
+        self.assertNotIn("invoices/b.md", get_text)
+        self.assertIn("contracts/a.md", get_text)
+
     def test_get_line_range_suffix(self):
         reply = _call_tool(self.session, "get", {"file": "contracts/a.md:1:2"})
         text = reply["result"]["content"][0]["text"]

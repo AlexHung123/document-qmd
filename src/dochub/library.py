@@ -3,15 +3,11 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from .paths import PathError, markdown_dir, parse_user_id, user_root
+from .paths import PUBLIC_OWNER_ID, PathError, markdown_dir, parse_user_id, user_root
 
 LIBRARY_PRIVATE = "private"
 LIBRARY_PUBLIC = "public"
 LIBRARIES = (LIBRARY_PRIVATE, LIBRARY_PUBLIC)
-
-# Reserved control-plane owner for the shared public library.
-# This is never a users/<id>/ path and must not collide with a JWT user id.
-PUBLIC_OWNER_ID = "__public__"
 
 WIKI_INDEX = "wiki/index.md"
 

@@ -27,6 +27,12 @@ class PathTests(unittest.TestCase):
             parse_user_id("a/b")
         with self.assertRaises(PathError):
             parse_user_id("")
+        with self.assertRaises(PathError):
+            parse_user_id(".")
+        with self.assertRaises(PathError):
+            parse_user_id("..")
+        with self.assertRaises(PathError):
+            parse_user_id("__public__")
 
     def test_sanitize_filename(self):
         self.assertEqual(sanitize_filename("report.pdf"), "report.pdf")
@@ -60,6 +66,16 @@ class PathTests(unittest.TestCase):
             self.assertTrue(rel.endswith(".md"))
             self.assertNotEqual(rel, "note.md")
 
+    def test_unique_relpath_skips_occupied_suffix(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            (root / "note.md").write_text("x")
+            (root / "note-abcd1234.md").write_text("y")
+            rel = unique_relpath(root, "note.md", "abcd1234-xxxx")
+            self.assertNotEqual(rel, "note.md")
+            self.assertNotEqual(rel, "note-abcd1234.md")
+            self.assertFalse((root / rel).exists())
+
     def test_markdown_relpath(self):
         self.assertEqual(markdown_relpath_for("2026/11/a.pdf"), "2026/11/a.md")
         self.assertEqual(markdown_relpath_for("a.md"), "a.md")
@@ -69,6 +85,10 @@ class PathTests(unittest.TestCase):
             data = Path(raw)
             root = user_root(data, "alice")
             self.assertEqual(root, (data / "users" / "alice").resolve())
+            self.assertEqual(root.parent, (data / "users").resolve())
+            for bad in (".", "..", "__public__"):
+                with self.assertRaises(PathError):
+                    user_root(data, bad)
 
     def test_ensure_relative_dir(self):
         from dochub.paths import ensure_relative_dir

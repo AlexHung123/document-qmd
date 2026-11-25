@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import socket
 import tempfile
 import threading
 import unittest
@@ -97,3 +98,29 @@ class LiveHttpTests(unittest.TestCase):
         self.assertGreaterEqual(start, 0)
         token = disposition[start + len(marker) :].split(";")[0].strip()
         self.assertEqual(unquote(token), "季度報告.md")
+
+    def test_oversize_content_length_writes_one_413(self):
+        payload = (
+            "POST /v1/files HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            "X-User-Id: alice\r\n"
+            "Content-Type: application/json\r\n"
+            "Content-Length: 4194304\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+        ).encode("ascii")
+        with socket.create_connection(("127.0.0.1", self.port), timeout=5) as sock:
+            sock.sendall(payload)
+            sock.shutdown(socket.SHUT_WR)
+            chunks: list[bytes] = []
+            while True:
+                data = sock.recv(65536)
+                if not data:
+                    break
+                chunks.append(data)
+        raw = b"".join(chunks)
+        self.assertTrue(raw.startswith(b"HTTP/1.1 413"), raw[:80])
+        self.assertEqual(raw.count(b"HTTP/1.1"), 1, raw[:400])
+        _header, _, body = raw.partition(b"\r\n\r\n")
+        error = json.loads(body)
+        self.assertEqual(error["error"], "too_large")
