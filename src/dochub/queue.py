@@ -34,6 +34,7 @@ class FileRow:
     inbox_relpath: str
     markdown_relpath: str | None
     provided_markdown_relpath: str | None
+    markdown_size_bytes: int | None
     created_at: str
     task_id: str | None
 
@@ -72,6 +73,7 @@ def _row_file(row: sqlite3.Row) -> FileRow:
         inbox_relpath=row["inbox_relpath"],
         markdown_relpath=row["markdown_relpath"],
         provided_markdown_relpath=row["provided_markdown_relpath"],
+        markdown_size_bytes=row["markdown_size_bytes"] if "markdown_size_bytes" in row.keys() else None,
         created_at=row["created_at"],
         task_id=row["task_id"],
     )
@@ -132,6 +134,7 @@ class ControlStore:
               inbox_relpath TEXT NOT NULL,
               markdown_relpath TEXT,
               provided_markdown_relpath TEXT,
+              markdown_size_bytes INTEGER,
               created_at TEXT NOT NULL,
               task_id TEXT
             );
@@ -164,7 +167,13 @@ class ControlStore:
               ON tasks(user_id, status);
             """
         )
+        self._ensure_column("files", "markdown_size_bytes", "INTEGER")
         self._db.commit()
+
+    def _ensure_column(self, table: str, name: str, decl: str) -> None:
+        cols = {info[1] for info in self._db.execute(f"PRAGMA table_info({table})")}
+        if name not in cols:
+            self._db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
 
     @contextmanager
     def transaction(self, immediate: bool = False) -> Iterator[sqlite3.Connection]:
@@ -259,6 +268,7 @@ class ControlStore:
         size_bytes: int,
         inbox_relpath: str,
         markdown_relpath: str | None,
+        markdown_size_bytes: int | None = None,
         file_id: str | None = None,
     ) -> FileRow:
         """Register a file already on disk, without enqueueing an ingest task.
@@ -273,8 +283,9 @@ class ControlStore:
                 """
                 INSERT INTO files(
                   id, user_id, original_filename, content_type, sha256, size_bytes,
-                  inbox_relpath, markdown_relpath, provided_markdown_relpath, created_at, task_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL)
+                  inbox_relpath, markdown_relpath, provided_markdown_relpath,
+                  markdown_size_bytes, created_at, task_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, NULL)
                 """,
                 (
                     file_id,
@@ -285,6 +296,7 @@ class ControlStore:
                     size_bytes,
                     inbox_relpath,
                     markdown_relpath,
+                    markdown_size_bytes,
                     now,
                 ),
             )
@@ -336,6 +348,10 @@ class ControlStore:
     def set_markdown_relpath(self, file_id: str, relpath: str) -> None:
         with self.transaction() as db:
             db.execute("UPDATE files SET markdown_relpath=? WHERE id=?", (relpath, file_id))
+
+    def set_markdown_size_bytes(self, file_id: str, size_bytes: int) -> None:
+        with self.transaction() as db:
+            db.execute("UPDATE files SET markdown_size_bytes=? WHERE id=?", (size_bytes, file_id))
 
     def set_stage(self, task_id: str, stage: str) -> None:
         if stage not in STAGES:

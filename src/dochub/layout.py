@@ -49,10 +49,7 @@ def ensure_user_tree(data_root: Path, user_id: str, qmd) -> Path:
     chmod_private_dir(markdown_dir(root))
     chmod_private_dir(qmd_dir(root))
     _ensure_index_yml(qmd_dir(root) / "index.yml", markdown_dir(root))
-    qmd.init_index(root)
-    sqlite = qmd_dir(root) / "index.sqlite"
-    if not sqlite.exists():
-        raise LayoutError(f"qmd init did not create {sqlite}")
+    _ensure_qmd_index(root, qmd)
     return root
 
 
@@ -70,11 +67,18 @@ def ensure_public_tree(data_root: Path, qmd) -> Path:
     chmod_private_dir(markdown_dir(root))
     chmod_private_dir(qmd_dir(root))
     _ensure_index_yml(qmd_dir(root) / "index.yml", markdown_dir(root))
-    qmd.init_index(root)
+    _ensure_qmd_index(root, qmd)
+    return root
+
+
+def _ensure_qmd_index(root: Path, qmd) -> None:
+    """Run `qmd init` only when the local index sqlite is missing."""
     sqlite = qmd_dir(root) / "index.sqlite"
+    if sqlite.exists():
+        return
+    qmd.init_index(root)
     if not sqlite.exists():
         raise LayoutError(f"qmd init did not create {sqlite}")
-    return root
 
 
 def _ensure_index_yml(yml: Path, markdown_path: Path) -> None:

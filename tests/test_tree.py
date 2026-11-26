@@ -7,6 +7,7 @@ from pathlib import Path
 
 import support
 from dochub.paths import inbox_dir, markdown_dir
+from dochub.tree import _file_brief
 from test_api import _file_body
 
 
@@ -103,3 +104,76 @@ class TreeTests(unittest.TestCase):
             _file_body(relative="docs", markdown="# n"),
         )
         self.assertEqual(resp.status, 409)
+
+    def test_tree_uses_stored_sizes_not_disk(self):
+        self.app.handle("POST", "/v1/folders", self._headers(), json.dumps({"path": "contracts/2024"}).encode())
+        up = self.app.handle(
+            "POST",
+            "/v1/files",
+            self._headers(),
+            _file_body(filename="report.pdf", content=b"%PDF", markdown="# report", relative="contracts/2024/report.pdf"),
+        )
+        self.assertEqual(up.status, 202)
+        file_id = json.loads(up.body)["file"]["id"]
+        stored = self.app.store.get_file(file_id)
+        self.assertIsNotNone(stored.markdown_size_bytes)
+        root = self.data / "users" / "alice"
+        (inbox_dir(root) / "contracts" / "2024" / "report.pdf").write_bytes(b"x" * 100)
+        (markdown_dir(root) / "contracts" / "2024" / "report.md").write_text("# much longer markdown\n" * 40, encoding="utf-8")
+        tree = self.app.handle("GET", "/v1/tree", self._headers(), b"")
+        self.assertEqual(tree.status, 200)
+        payload = json.loads(tree.body)["tree"]
+        contracts = next(c for c in payload["children"] if c["name"] == "contracts")
+        year = next(c for c in contracts["children"] if c["name"] == "2024")
+        report = next(c for c in year["children"] if c["name"] == "report.pdf")
+        self.assertEqual(report["file"]["inbox_size_bytes"], 4)
+        self.assertEqual(report["file"]["markdown_size_bytes"], stored.markdown_size_bytes)
+        self.assertNotEqual(report["file"]["markdown_size_bytes"], (markdown_dir(root) / "contracts" / "2024" / "report.md").stat().st_size)
+
+    def test_tree_omits_unknown_markdown_size(self):
+        self.app.handle("POST", "/v1/folders", self._headers(), json.dumps({"path": "legacy"}).encode())
+        inbox = inbox_dir(self.data / "users" / "alice") / "legacy" / "old.pdf"
+        inbox.write_bytes(b"%PDF")
+        self.app.store.insert_registered_file(
+            user_id="alice",
+            original_filename="old.pdf",
+            content_type="application/pdf",
+            sha256="abc",
+            size_bytes=4,
+            inbox_relpath="legacy/old.pdf",
+            markdown_relpath="legacy/old.md",
+        )
+        tree = self.app.handle("GET", "/v1/tree", self._headers(), b"")
+        self.assertEqual(tree.status, 200)
+        payload = json.loads(tree.body)["tree"]
+        folder = next(c for c in payload["children"] if c["name"] == "legacy")
+        report = next(c for c in folder["children"] if c["name"] == "old.pdf")
+        self.assertEqual(report["file"]["inbox_size_bytes"], 4)
+        self.assertNotIn("markdown_size_bytes", report["file"])
+
+    def test_file_brief_does_not_stat(self):
+        row = self.app.store.insert_registered_file(
+            user_id="alice",
+            original_filename="note.md",
+            content_type="text/markdown",
+            sha256="abc",
+            size_bytes=9,
+            inbox_relpath="note.md",
+            markdown_relpath="note.md",
+            markdown_size_bytes=12,
+        )
+        brief = _file_brief(row)
+        self.assertEqual(brief["inbox_size_bytes"], 9)
+        self.assertEqual(brief["markdown_size_bytes"], 12)
+        row_unknown = self.app.store.insert_registered_file(
+            user_id="alice",
+            original_filename="other.md",
+            content_type="text/markdown",
+            sha256="def",
+            size_bytes=3,
+            inbox_relpath="other.md",
+            markdown_relpath="other.md",
+        )
+        unknown = _file_brief(row_unknown)
+        self.assertEqual(unknown["inbox_size_bytes"], 3)
+        self.assertNotIn("markdown_size_bytes", unknown)

@@ -358,10 +358,13 @@ class App:
             return Response.error(409, "conflict", "file already exists at this relative_path")
         try:
             atomic_write_bytes(safe_join(inbox, rel), file_bytes)
-            atomic_write_text(safe_join(md_root, md_rel), md_body)
+            md_path = safe_join(md_root, md_rel)
+            atomic_write_text(md_path, md_body)
+            self.store.set_markdown_size_bytes(file_id, md_path.stat().st_size)
         except Exception:
             self.store.delete_upload(file_id)
             raise
+        file_row = self.store.get_file(file_id) or file_row
         log(
             "upload stored",
             user_id=user_id,
