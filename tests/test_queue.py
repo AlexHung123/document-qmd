@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -89,3 +90,55 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(backoff_seconds(1), 5)
         self.assertEqual(backoff_seconds(2), 15)
         self.assertEqual(backoff_seconds(5), 300)
+
+    def test_migrates_markdown_size_bytes_column(self):
+        path = Path(self.tmp.name) / "legacy.sqlite"
+        db = sqlite3.connect(path)
+        db.executescript(
+            """
+            CREATE TABLE files (
+              id TEXT PRIMARY KEY,
+              user_id TEXT NOT NULL,
+              original_filename TEXT NOT NULL,
+              content_type TEXT,
+              sha256 TEXT NOT NULL,
+              size_bytes INTEGER NOT NULL,
+              inbox_relpath TEXT NOT NULL,
+              markdown_relpath TEXT,
+              provided_markdown_relpath TEXT,
+              created_at TEXT NOT NULL,
+              task_id TEXT
+            );
+            """
+        )
+        db.execute(
+            """
+            INSERT INTO files(
+              id, user_id, original_filename, content_type, sha256, size_bytes,
+              inbox_relpath, markdown_relpath, provided_markdown_relpath, created_at, task_id
+            ) VALUES ('legacy', 'alice', 'a.md', 'text/markdown', 'abc', 3, 'a.md', 'a.md', NULL, '2024-01-01T00:00:00Z', NULL)
+            """
+        )
+        db.commit()
+        db.close()
+        store = ControlStore(path)
+        self.addCleanup(store.close)
+        row = store.get_file("legacy")
+        self.assertIsNotNone(row)
+        self.assertIsNone(row.markdown_size_bytes)
+        store.set_markdown_size_bytes("legacy", 12)
+        self.assertEqual(store.get_file("legacy").markdown_size_bytes, 12)
+
+    def test_insert_registered_file_stores_markdown_size(self):
+        row = self.store.insert_registered_file(
+            user_id="alice",
+            original_filename="a.md",
+            content_type="text/markdown",
+            sha256="abc",
+            size_bytes=3,
+            inbox_relpath="a.md",
+            markdown_relpath="a.md",
+            markdown_size_bytes=11,
+        )
+        self.assertEqual(row.markdown_size_bytes, 11)
+        self.assertEqual(self.store.get_file(row.id).markdown_size_bytes, 11)

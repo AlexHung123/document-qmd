@@ -44,7 +44,7 @@ def build_inbox_tree(user_root: Path, files: list[FileRow], prefix: str | None =
                     "type": "file",
                     "name": name,
                     "path": child_rel,
-                    "file": _file_brief(row, user_root) if row else None,
+                    "file": _file_brief(row) if row else None,
                 }
             )
         parent["children"].sort(key=lambda n: (0 if n["type"] == "dir" else 1, n["name"]))
@@ -71,21 +71,7 @@ def _dir_node(nodes: dict[str, dict[str, Any]], rel: str) -> dict[str, Any]:
     return node
 
 
-def _existing_size(root: Path, rel: str | None) -> int | None:
-    if not rel:
-        return None
-    try:
-        base = root.resolve()
-        path = (base / rel).resolve()
-        path.relative_to(base)
-        if path.is_file():
-            return path.stat().st_size
-    except (OSError, ValueError):
-        return None
-    return None
-
-
-def _file_brief(row: FileRow, user_root: Path | None = None) -> dict[str, Any]:
+def _file_brief(row: FileRow) -> dict[str, Any]:
     brief = {
         "id": row.id,
         "original_filename": row.original_filename,
@@ -95,13 +81,10 @@ def _file_brief(row: FileRow, user_root: Path | None = None) -> dict[str, Any]:
         "task_id": row.task_id,
         "created_at": row.created_at,
     }
-    if user_root is not None:
-        inbox_size = _existing_size(inbox_dir(user_root), row.inbox_relpath)
-        markdown_size = _existing_size(markdown_dir(user_root), row.markdown_relpath)
-        if inbox_size is not None:
-            brief["inbox_size_bytes"] = inbox_size
-        if markdown_size is not None:
-            brief["markdown_size_bytes"] = markdown_size
+    if row.size_bytes is not None:
+        brief["inbox_size_bytes"] = row.size_bytes
+    if row.markdown_size_bytes is not None:
+        brief["markdown_size_bytes"] = row.markdown_size_bytes
     return brief
 
 

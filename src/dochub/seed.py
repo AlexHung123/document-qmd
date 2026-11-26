@@ -73,12 +73,15 @@ def seed_public_folder(
             else:
                 skipped += 1
             md_rel = None
+            md_size = None
             if dest.suffix.lower() == ".md" or src_file.suffix.lower() == ".md":
                 md_rel = markdown_relpath_for(rel)
                 md_dest = safe_join(md_root, md_rel)
                 md_dest.parent.mkdir(parents=True, exist_ok=True)
                 if not md_dest.exists() or not existed:
                     shutil.copy2(src_file, md_dest)
+                if md_dest.is_file():
+                    md_size = md_dest.stat().st_size
             row = store.get_file_by_inbox(PUBLIC_OWNER_ID, rel)
             if row is None:
                 data = dest.read_bytes()
@@ -91,7 +94,11 @@ def seed_public_folder(
                     size_bytes=len(data),
                     inbox_relpath=rel,
                     markdown_relpath=md_rel,
+                    markdown_size_bytes=md_size,
                 )
+            elif md_size is not None and row.markdown_size_bytes is None:
+                store.set_markdown_size_bytes(row.id, md_size)
+                row = store.get_file(row.id) or row
             registered.append(row)
 
     indexed = False
